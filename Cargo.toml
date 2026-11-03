@@ -1,0 +1,96 @@
+[package]
+name = "bawkbit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Torrent client"
+publish = false
+
+[workspace]
+members = ["crates/core", "crates/web", "crates/daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-only"
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+dirs = "7.0.0"
+getrandom = "0.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net", "signal"] }
+tracing = "0.1"
+bawkbit-core = { path = "crates/core" }
+bawkbit-web = { path = "crates/web" }
+
+[dependencies]
+anyhow.workspace = true
+async-channel = "2.5.0"
+bawkbit-core.workspace = true
+bawkbit-web.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+gpui-kit = "=0.7.3"
+log = "0.4.34"
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6.1"
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["ico", "png"] }
+resvg = "0.46.0"
+
+[profile.dev.package]
+gpui-pre = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-kit = { opt-level = 3 }
+gpui-kit-assets = { opt-level = 3 }
+gpui-pre-macros = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+ring = { opt-level = 3 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[build-dependencies]
+winresource = "0.1.31"
+
+[package.metadata.deb]
+maintainer = "juddisjudd <juddisjudd@users.noreply.github.com>"
+copyright = "2026, juddisjudd"
+license-file = ["LICENSE", "0"]
+section = "net"
+extended-description = "Download and share with BitTorrent. A native desktop app, a web UI for your other devices, and bawkbitd to run the engine and web UI without a window."
+depends = "$auto, libvulkan1"
+assets = [
+    ["target/release/bawkbit", "usr/bin/", "755"],
+    ["target/release/bawkbitd", "usr/bin/", "755"],
+    ["packaging/linux/bawkbit.desktop", "usr/share/applications/", "644"],
+    ["assets/brand/bawkbit.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/bawkbit", dest = "/usr/bin/bawkbit", mode = "755" },
+    { source = "target/release/bawkbitd", dest = "/usr/bin/bawkbitd", mode = "755" },
+    { source = "packaging/linux/bawkbit.desktop", dest = "/usr/share/applications/bawkbit.desktop", mode = "644" },
+    { source = "assets/brand/bawkbit.png", dest = "/usr/share/icons/hicolor/256x256/apps/bawkbit.png", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/bawkbit/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+"libvulkan.so.1()(64bit)" = "*"

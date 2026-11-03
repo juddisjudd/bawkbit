@@ -1,0 +1,25 @@
+[package]
+name = "bawkbit-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "bawkbit's web UI and HTTP API"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+argon2 = "0.5"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+bawkbit-core.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http = { version = "0.6", features = ["compression-gzip"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"

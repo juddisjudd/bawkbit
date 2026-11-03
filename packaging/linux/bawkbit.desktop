@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=bawkbit
+GenericName=Torrent client
+Comment=Download and share with BitTorrent
+Exec=bawkbit %U
+Icon=bawkbit
+Terminal=false
+Categories=Network;FileTransfer;P2P;
+MimeType=x-scheme-handler/magnet;application/x-bittorrent;
+StartupWMClass=bawkbit

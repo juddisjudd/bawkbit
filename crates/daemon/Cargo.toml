@@ -1,0 +1,16 @@
+[package]
+name = "bawkbitd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "bawkbit without a window: the engine and the web UI"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+bawkbit-core.workspace = true
+bawkbit-web.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

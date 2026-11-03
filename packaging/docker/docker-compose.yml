@@ -1,0 +1,13 @@
+services:
+  bawkbit:
+    build:
+      context: ../..
+      dockerfile: packaging/docker/Dockerfile
+    container_name: bawkbit
+    restart: unless-stopped
+    ports:
+      - "8228:8228"
+      - "51413:51413/tcp"
+    volumes:
+      - ./config:/config
+      - ./downloads:/downloads

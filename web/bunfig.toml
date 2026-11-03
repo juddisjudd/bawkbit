@@ -1,0 +1,3 @@
+[install]
+# only install versions that have been public for a day, so a hijacked release has time to be caught
+minimumReleaseAge = 86400

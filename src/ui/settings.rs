@@ -1,0 +1,942 @@
+use std::collections::HashMap;
+
+use bawkbit_core::Settings;
+use bawkbit_web::Status as WebStatus;
+use gpui_kit::assets::IconName;
+use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{Icon, Sizable, WindowExt};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+
+use super::kit;
+use crate::config::Config;
+use crate::engine::Engine;
+use crate::format;
+use crate::theme::{self, DEFAULT_THEME, Look, Mode, Palette, palette};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Downloads,
+    Connection,
+    Speed,
+    Queue,
+    Web,
+    Appearance,
+    About,
+}
+
+impl Tab {
+    const ALL: [Tab; 7] = [
+        Tab::Downloads,
+        Tab::Connection,
+        Tab::Speed,
+        Tab::Queue,
+        Tab::Web,
+        Tab::Appearance,
+        Tab::About,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Downloads => "downloads",
+            Tab::Connection => "connection",
+            Tab::Speed => "speed",
+            Tab::Queue => "queue",
+            Tab::Web => "web ui",
+            Tab::Appearance => "appearance",
+            Tab::About => "about",
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Tab::Downloads => IconName::FolderDown,
+            Tab::Connection => IconName::Network,
+            Tab::Speed => IconName::Gauge,
+            Tab::Queue => IconName::Hourglass,
+            Tab::Web => IconName::Globe,
+            Tab::Appearance => IconName::Palette,
+            Tab::About => IconName::Info,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Field {
+    DownloadDir,
+    WatchDir,
+    Port,
+    PeerLimit,
+    DownLimit,
+    UpLimit,
+    AltDown,
+    AltUp,
+    From,
+    To,
+    MaxActive,
+    Ratio,
+    SeedMinutes,
+    WebAddress,
+    WebPort,
+    WebUser,
+}
+
+pub enum SettingsEvent {
+    Theme(SharedString, Mode),
+    QuickAdd(bool),
+}
+
+pub struct SettingsView {
+    engine: Entity<Engine>,
+    tab: Tab,
+    theme: SharedString,
+    mode: Mode,
+    quick_add: bool,
+    inputs: HashMap<Field, Entity<InputState>>,
+    errors: HashMap<Field, &'static str>,
+    password: Entity<InputState>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<SettingsEvent> for SettingsView {}
+
+impl SettingsView {
+    pub fn new(
+        engine: Entity<Engine>,
+        config: &Config,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let s = engine.read(cx).core().settings();
+        let values = [
+            (Field::DownloadDir, s.download_dir.clone(), ""),
+            (Field::WatchDir, s.watch_dir.clone(), "off"),
+            (Field::Port, s.listen_port.to_string(), ""),
+            (Field::PeerLimit, nonzero(s.peer_limit), "engine default"),
+            (
+                Field::DownLimit,
+                format::rate_input(s.down_limit),
+                "no limit",
+            ),
+            (Field::UpLimit, format::rate_input(s.up_limit), "no limit"),
+            (
+                Field::AltDown,
+                format::rate_input(s.alt_down_limit),
+                "no limit",
+            ),
+            (Field::AltUp, format::rate_input(s.alt_up_limit), "no limit"),
+            (Field::From, format::clock(s.schedule.from), "08:00"),
+            (Field::To, format::clock(s.schedule.to), "20:00"),
+            (
+                Field::MaxActive,
+                nonzero(s.max_active_downloads),
+                "no limit",
+            ),
+            (
+                Field::Ratio,
+                if s.ratio_limit > 0.0 {
+                    s.ratio_limit.to_string()
+                } else {
+                    String::new()
+                },
+                "seed forever",
+            ),
+            (Field::SeedMinutes, nonzero(s.seed_minutes), "seed forever"),
+            (Field::WebAddress, s.web.address.clone(), "0.0.0.0"),
+            (Field::WebPort, s.web.port.to_string(), ""),
+            (Field::WebUser, s.web.username.clone(), "admin"),
+        ];
+        let mut inputs = HashMap::new();
+        let mut subscriptions = Vec::new();
+        for (field, value, placeholder) in values {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .default_value(value)
+            });
+            subscriptions.push(cx.subscribe_in(
+                &input,
+                window,
+                move |this, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        this.commit(field, window, cx);
+                    }
+                },
+            ));
+            inputs.insert(field, input);
+        }
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("new password")
+                .masked(true)
+        });
+        Self {
+            engine,
+            tab: Tab::Downloads,
+            theme: config.theme.clone().into(),
+            mode: config.mode,
+            quick_add: config.quick_add,
+            inputs,
+            errors: HashMap::new(),
+            password,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    fn settings(&self, cx: &App) -> Settings {
+        self.engine.read(cx).core().settings()
+    }
+
+    fn value(&self, field: Field, cx: &App) -> String {
+        self.inputs[&field].read(cx).value().trim().to_string()
+    }
+
+    fn commit(&mut self, field: Field, window: &mut Window, cx: &mut Context<Self>) {
+        let value = self.value(field, cx);
+        let mut settings = self.settings(cx);
+        match apply(field, &value, &mut settings) {
+            Ok(()) => {
+                self.errors.remove(&field);
+                self.save(settings, window, cx);
+            }
+            Err(message) => {
+                self.errors.insert(field, message);
+            }
+        }
+        cx.notify();
+    }
+
+    fn save(&mut self, settings: Settings, window: &mut Window, cx: &mut Context<Self>) {
+        if settings == self.settings(cx) {
+            return;
+        }
+        let job = self
+            .engine
+            .read(cx)
+            .run(move |core| async move { core.update_settings(settings).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = job.await;
+            let _ = this.update_in(cx, |_, window, cx| {
+                if let Err(err) = result {
+                    window.push_notification(Notification::error(format!("{err:#}")), cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle(
+        &mut self,
+        change: impl FnOnce(&mut Settings),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut settings = self.settings(cx);
+        change(&mut settings);
+        self.save(settings, window, cx);
+        cx.notify();
+    }
+
+    fn browse(&mut self, field: Field, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("use this folder".into()),
+        });
+        let input = self.inputs[&field].clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                input.update(cx, |state, cx| {
+                    state.set_value(path.to_string_lossy().into_owned(), window, cx)
+                });
+                this.commit(field, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn set_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let password = self.password.read(cx).value().to_string();
+        if password.chars().count() < 8 {
+            window.push_notification(Notification::warning("use at least 8 characters"), cx);
+            return;
+        }
+        self.password
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        let job = self.engine.read(cx).run(move |core| async move {
+            let hash = bawkbit_web::hash_password(&password)?;
+            core.set_web_password_hash(hash)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = job.await;
+            let _ = this.update_in(cx, |_, window, cx| {
+                let note = match result {
+                    Ok(()) => Notification::success("password saved"),
+                    Err(err) => Notification::error(format!("{err:#}")),
+                };
+                window.push_notification(note, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn pick_theme(&mut self, id: SharedString, mode: Mode, cx: &mut Context<Self>) {
+        self.theme = id.clone();
+        self.mode = mode;
+        cx.emit(SettingsEvent::Theme(id, mode));
+        cx.notify();
+    }
+
+    fn text(&self, field: Field, p: &Palette) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(kit::input(&self.inputs[&field]))
+            .when_some(self.errors.get(&field), |this, error| {
+                this.child(div().text_size(px(12.)).text_color(p.danger).child(*error))
+            })
+    }
+
+    fn folder(&self, field: Field, p: &Palette, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .gap_2()
+            .child(div().flex_1().child(self.text(field, p)))
+            .child(
+                kit::icon_button(
+                    SharedString::from(format!("browse-{field:?}")),
+                    IconName::FolderOpen,
+                    "pick a folder",
+                )
+                .on_click(cx.listener(move |this, _, window, cx| this.browse(field, window, cx))),
+            )
+    }
+
+    fn switch(
+        &self,
+        id: &'static str,
+        on: bool,
+        change: impl Fn(&mut Settings, bool) + 'static,
+        cx: &mut Context<Self>,
+    ) -> Switch {
+        Switch::new(id).checked(on).on_click(cx.listener(
+            move |this, checked: &bool, window, cx| {
+                let checked = *checked;
+                this.toggle(|s| change(s, checked), window, cx)
+            },
+        ))
+    }
+
+    fn render_tabs(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        div()
+            .w(px(170.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(Tab::ALL.map(|tab| {
+                let active = tab == self.tab;
+                div()
+                    .id(tab.label())
+                    .h(px(32.))
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .text_color(if active { p.text_strong } else { p.text_weak })
+                    .when(active, |this| this.bg(p.bg_hover))
+                    .hover(|style| style.text_color(p.text_strong))
+                    .child(Icon::new(tab.icon()).size(px(15.)))
+                    .child(div().flex_1().child(tab.label()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tab = tab;
+                        cx.notify();
+                    }))
+            }))
+    }
+
+    fn render_downloads(&self, s: &Settings, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let panel = panel()
+            .child(field(
+                "download folder",
+                "",
+                self.folder(Field::DownloadDir, p, cx),
+                p,
+            ))
+            .child(field(
+                "watch folder",
+                ".torrent files put here are added on their own",
+                self.folder(Field::WatchDir, p, cx),
+                p,
+            ))
+            .child(field(
+                "start paused",
+                "",
+                self.switch(
+                    "start-paused",
+                    s.start_paused,
+                    |s, on| s.start_paused = on,
+                    cx,
+                ),
+                p,
+            ))
+            .child(field(
+                "add magnets without asking",
+                "skips the file list for magnet links",
+                Switch::new("quick-add")
+                    .checked(self.quick_add)
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.quick_add = *checked;
+                        cx.emit(SettingsEvent::QuickAdd(*checked));
+                        cx.notify();
+                    })),
+                p,
+            ));
+        #[cfg(windows)]
+        let panel = {
+            let handled = crate::instance::links::handled_here();
+            let control: AnyElement = if handled {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_color(p.text_weak)
+                    .child(
+                        Icon::new(IconName::CircleCheck)
+                            .size(px(14.))
+                            .text_color(p.success),
+                    )
+                    .child("bawkbit opens them")
+                    .into_any_element()
+            } else {
+                kit::button("take-links", cx)
+                    .small()
+                    .label("open them with bawkbit")
+                    .on_click(cx.listener(|_, _, window, cx| {
+                        if let Err(err) = crate::instance::links::take_over() {
+                            window.push_notification(Notification::error(err), cx);
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            };
+            panel.child(field("magnet links and .torrent files", "", control, p))
+        };
+        panel
+    }
+
+    fn render_connection(&self, s: &Settings, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let port = self.engine.read(cx).snapshot.totals.port;
+        let port_note = match port {
+            Some(port) if port == s.listen_port => String::new(),
+            Some(port) => format!("listening on {port}"),
+            None => "not listening: is another app using this port?".into(),
+        };
+        panel()
+            .child(field(
+                "listening port",
+                port_note,
+                self.text(Field::Port, p),
+                p,
+            ))
+            .child(field(
+                "upnp",
+                "asks your router to open the port",
+                self.switch("upnp", s.upnp, |s, on| s.upnp = on, cx),
+                p,
+            ))
+            .child(field(
+                "dht",
+                "finds peers without trackers",
+                self.switch("dht", s.dht, |s, on| s.dht = on, cx),
+                p,
+            ))
+            .child(field(
+                "peers per torrent",
+                "",
+                self.text(Field::PeerLimit, p),
+                p,
+            ))
+    }
+
+    fn render_speed(&self, s: &Settings, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let days = div().flex().gap_1().children(
+            ["mo", "tu", "we", "th", "fr", "sa", "su"]
+                .into_iter()
+                .enumerate()
+                .map(|(ix, label)| {
+                    let on = s.schedule.days & (1 << ix) != 0;
+                    kit::chip(SharedString::from(format!("day-{ix}")), label, on, p).on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.toggle(|s| s.schedule.days ^= 1 << ix, window, cx)
+                        }),
+                    )
+                }),
+        );
+        let pair = |a: Field, b: Field, icons: (IconName, IconName)| {
+            div()
+                .flex()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(icons.0).size(px(14.)).text_color(p.blue))
+                        .child(div().flex_1().child(self.text(a, p))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(Icon::new(icons.1).size(px(14.)).text_color(p.green))
+                        .child(div().flex_1().child(self.text(b, p))),
+                )
+        };
+        let arrows = (IconName::ArrowDown, IconName::ArrowUp);
+        panel()
+            .child(field(
+                "limits",
+                "per second, like 500 KB or 2 MB",
+                pair(Field::DownLimit, Field::UpLimit, arrows),
+                p,
+            ))
+            .child(field(
+                "alternative limits",
+                "the turtle in the title bar switches to these",
+                pair(Field::AltDown, Field::AltUp, arrows),
+                p,
+            ))
+            .child(field(
+                "schedule",
+                "uses the alternative limits at these times",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(self.switch(
+                        "schedule",
+                        s.schedule.enabled,
+                        |s, on| s.schedule.enabled = on,
+                        cx,
+                    ))
+                    .when(s.schedule.enabled, |this| {
+                        this.child(pair(
+                            Field::From,
+                            Field::To,
+                            (IconName::Clock, IconName::Clock),
+                        ))
+                        .child(days)
+                    }),
+                p,
+            ))
+    }
+
+    fn render_queue(&self, p: &Palette) -> Div {
+        panel()
+            .child(field(
+                "downloads at once",
+                "the rest wait their turn",
+                self.text(Field::MaxActive, p),
+                p,
+            ))
+            .child(field(
+                "stop seeding at ratio",
+                "uploaded divided by downloaded",
+                self.text(Field::Ratio, p),
+                p,
+            ))
+            .child(field(
+                "stop seeding after",
+                "minutes",
+                self.text(Field::SeedMinutes, p),
+                p,
+            ))
+    }
+
+    fn render_web(&self, s: &Settings, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let status = self.engine.read(cx).web_status();
+        let (color, text, url) = match &status {
+            WebStatus::Listening(addr) => {
+                let host = if addr.ip().is_unspecified() {
+                    "localhost".to_string()
+                } else {
+                    addr.ip().to_string()
+                };
+                let url = format!("http://{host}:{}", addr.port());
+                (p.success, url.clone(), Some(url))
+            }
+            WebStatus::Failed(err) => (p.danger, err.clone(), None),
+            WebStatus::Off => (p.text_weaker, "off".to_string(), None),
+        };
+        let has_password = !s.web.password_hash.is_empty();
+        panel()
+            .child(field(
+                "web ui",
+                "control bawkbit from a browser on any device",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(self.switch("web", s.web.enabled, |s, on| s.web.enabled = on, cx))
+                    .child(kit::dot(color))
+                    .child(kit::truncate(text).text_color(p.text_weak))
+                    .when_some(url, |this, url| {
+                        this.child(
+                            kit::icon_button(
+                                "open-web",
+                                IconName::ExternalLink,
+                                "open in a browser",
+                            )
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                        )
+                    }),
+                p,
+            ))
+            .child(field(
+                "address and port",
+                "0.0.0.0 lets other devices in; 127.0.0.1 only this one",
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(div().flex_1().child(self.text(Field::WebAddress, p)))
+                    .child(
+                        div()
+                            .w(px(110.))
+                            .flex_none()
+                            .child(self.text(Field::WebPort, p)),
+                    ),
+                p,
+            ))
+            .child(field("name", "", self.text(Field::WebUser, p), p))
+            .child(field(
+                "password",
+                if has_password {
+                    "a password is set"
+                } else {
+                    "needed before anyone can log in"
+                },
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(kit::input(&self.password).mask_toggle()),
+                    )
+                    .child(kit::button("set-password", cx).label("save").on_click(
+                        cx.listener(|this, _, window, cx| this.set_password(window, cx)),
+                    )),
+                p,
+            ))
+            .child(field(
+                "skip login on this computer",
+                "for browsers here; never for other devices or proxies",
+                self.switch(
+                    "local-bypass",
+                    s.web.local_bypass,
+                    |s, on| s.web.local_bypass = on,
+                    cx,
+                ),
+                p,
+            ))
+    }
+
+    fn render_appearance(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let own = self.theme == DEFAULT_THEME;
+        let modes = kit::segmented(p).children(
+            [
+                (Mode::System, "system"),
+                (Mode::Dark, "dark"),
+                (Mode::Light, "light"),
+            ]
+            .map(|(mode, label)| {
+                kit::segment(label, label, own && self.mode == mode, p).on_click(cx.listener(
+                    move |this, _, _, cx| this.pick_theme(DEFAULT_THEME.into(), mode, cx),
+                ))
+            }),
+        );
+        let looks = theme::looks(cx).to_vec();
+        let cards = div()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .children(looks.into_iter().map(|look| {
+                let active = look.id == self.theme;
+                let (bg, fg, cursor) = if look.id == DEFAULT_THEME && active {
+                    (p.bg, p.text_strong, p.yolk)
+                } else {
+                    (look.bg, look.fg, look.cursor)
+                };
+                look_card(&look, bg, fg, cursor, active, p).on_click(cx.listener({
+                    let id = look.id.clone();
+                    move |this, _, _, cx| {
+                        let mode = this.mode;
+                        this.pick_theme(id.clone(), mode, cx)
+                    }
+                }))
+            }));
+        panel().child(modes).child(cards)
+    }
+
+    fn render_about(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let home = bawkbit_core::data_dir();
+        panel()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        svg()
+                            .path(crate::assets::MARK)
+                            .size(px(28.))
+                            .text_color(p.text_strong),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_color(p.text_strong)
+                                    .child(format!("bawkbit {}", bawkbit_core::VERSION)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(p.text_weak)
+                                    .child("a torrent client"),
+                            ),
+                    ),
+            )
+            .child(field(
+                "settings and session",
+                "",
+                kit::button("open-home", cx)
+                    .small()
+                    .icon(Icon::new(IconName::FolderOpen))
+                    .label(SharedString::from(home.to_string_lossy().into_owned()))
+                    .on_click(move |_, _, cx| cx.open_with_system(&home)),
+                p,
+            ))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(p.text_weaker)
+                    .child("made with rust and gpui kit. torrents run on the librqbit engine."),
+            )
+    }
+}
+
+fn apply(field: Field, value: &str, s: &mut Settings) -> Result<(), &'static str> {
+    let count = |value: &str| -> Result<u32, &'static str> {
+        if value.is_empty() {
+            Ok(0)
+        } else {
+            value.parse().map_err(|_| "use a whole number")
+        }
+    };
+    let rate = |value: &str| format::parse_rate(value).ok_or("use a speed like 500 KB or 2 MB");
+    let port = |value: &str| {
+        value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or("use a port from 1 to 65535")
+    };
+    match field {
+        Field::DownloadDir if value.is_empty() => return Err("pick a folder"),
+        Field::DownloadDir => s.download_dir = value.into(),
+        Field::WatchDir => s.watch_dir = value.into(),
+        Field::Port => s.listen_port = port(value)?,
+        Field::PeerLimit => s.peer_limit = count(value)?,
+        Field::DownLimit => s.down_limit = rate(value)?,
+        Field::UpLimit => s.up_limit = rate(value)?,
+        Field::AltDown => s.alt_down_limit = rate(value)?,
+        Field::AltUp => s.alt_up_limit = rate(value)?,
+        Field::From => {
+            s.schedule.from = format::parse_clock(value).ok_or("use a time like 08:00")?
+        }
+        Field::To => s.schedule.to = format::parse_clock(value).ok_or("use a time like 20:00")?,
+        Field::MaxActive => s.max_active_downloads = count(value)?,
+        Field::Ratio => {
+            s.ratio_limit = if value.is_empty() {
+                0.0
+            } else {
+                value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|ratio| *ratio >= 0.0)
+                    .ok_or("use a number like 2 or 1.5")?
+            }
+        }
+        Field::SeedMinutes => s.seed_minutes = count(value)?,
+        Field::WebAddress => {
+            s.web.address = if value.is_empty() {
+                "0.0.0.0".into()
+            } else {
+                value.into()
+            }
+        }
+        Field::WebPort => s.web.port = port(value)?,
+        Field::WebUser if value.is_empty() => return Err("pick a name"),
+        Field::WebUser => s.web.username = value.into(),
+    }
+    Ok(())
+}
+
+fn nonzero(value: u32) -> String {
+    if value == 0 {
+        String::new()
+    } else {
+        value.to_string()
+    }
+}
+
+fn panel() -> Div {
+    div().flex().flex_col().gap_5()
+}
+
+fn field(
+    label: &'static str,
+    hint: impl Into<SharedString>,
+    control: impl IntoElement,
+    p: &Palette,
+) -> Div {
+    let hint = hint.into();
+    div()
+        .flex()
+        .gap_6()
+        .child(
+            div()
+                .w(px(220.))
+                .flex_none()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_color(p.text).child(label))
+                .when(!hint.is_empty(), |this| {
+                    this.child(div().text_size(px(12.)).text_color(p.text_weak).child(hint))
+                }),
+        )
+        .child(div().flex_1().min_w_0().max_w(px(560.)).child(control))
+}
+
+fn look_card(
+    look: &Look,
+    bg: Hsla,
+    fg: Hsla,
+    cursor: Hsla,
+    active: bool,
+    p: &Palette,
+) -> Stateful<Div> {
+    let mut words: Vec<&str> = look.label.split(' ').collect();
+    let last = words.pop().unwrap_or_default().to_string();
+    div()
+        .id(SharedString::from(format!("look-{}", look.id)))
+        .w(px(150.))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p(px(10.))
+        .rounded(px(4.))
+        .border_2()
+        .border_color(if active { p.yolk } else { p.border_weak })
+        .cursor_pointer()
+        .bg(bg)
+        .text_color(fg)
+        .text_size(px(12.))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_x(px(7.))
+                .children(words.into_iter().map(|word| div().child(word.to_string())))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(last)
+                        .child(div().w(px(7.)).h(px(13.)).bg(cursor)),
+                ),
+        )
+        .child(
+            div().flex().gap(px(3.)).children(
+                look.swatches
+                    .map(|color| div().size(px(12.)).rounded(px(2.)).bg(color)),
+            ),
+        )
+}
+
+impl Render for SettingsView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = palette(cx);
+        let s = self.settings(cx);
+        let body = match self.tab {
+            Tab::Downloads => self.render_downloads(&s, &p, cx),
+            Tab::Connection => self.render_connection(&s, &p, cx),
+            Tab::Speed => self.render_speed(&s, &p, cx),
+            Tab::Queue => self.render_queue(&p),
+            Tab::Web => self.render_web(&s, &p, cx),
+            Tab::Appearance => self.render_appearance(&p, cx),
+            Tab::About => self.render_about(&p, cx),
+        };
+        div()
+            .size_full()
+            .flex()
+            .gap_8()
+            .px(px(32.))
+            .pt(px(28.))
+            .child(self.render_tabs(&p, cx))
+            .child(
+                div()
+                    .id("settings-panel")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .pb_8()
+                    .child(body),
+            )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Field, Settings, apply};
+
+    #[test]
+    fn fields_parse_into_settings() {
+        let mut s = Settings::default();
+        apply(Field::DownLimit, "2 MB", &mut s).unwrap();
+        assert_eq!(s.down_limit, 2 * 1024 * 1024);
+        apply(Field::Ratio, "", &mut s).unwrap();
+        assert_eq!(s.ratio_limit, 0.0);
+        assert!(apply(Field::Port, "0", &mut s).is_err());
+        assert!(apply(Field::DownloadDir, "", &mut s).is_err());
+        apply(Field::WebAddress, "", &mut s).unwrap();
+        assert_eq!(s.web.address, "0.0.0.0");
+        apply(Field::From, "22:30", &mut s).unwrap();
+        assert_eq!(s.schedule.from, 22 * 60 + 30);
+    }
+}
