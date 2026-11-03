@@ -78,3 +78,15 @@ export function limitBytes(value: string, unit: 'k' | 'm'): number {
   if (!value.trim() || !Number.isFinite(n) || n <= 0) return 0
   return Math.round(n * (unit === 'm' ? 1024 * 1024 : 1024))
 }
+
+/** How long ago, in the largest unit that fits: 40s, 12m, 5h, 3d, 4mo, 2y. */
+export function age(unix: number | null, now = Date.now() / 1000): string {
+  if (!unix) return ''
+  const seconds = Math.max(0, now - unix)
+  if (seconds < 60) return `${Math.floor(seconds)}s`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`
+  if (seconds < 86400 * 60) return `${Math.floor(seconds / 86400)}d`
+  if (seconds < 86400 * 365) return `${Math.floor(seconds / (86400 * 30))}mo`
+  return `${Math.floor(seconds / (86400 * 365))}y`
+}

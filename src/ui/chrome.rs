@@ -313,6 +313,7 @@ impl Workspace {
             })
             .collect();
 
+        let search_active = self.page == Page::Search;
         let settings_active = self.page == Page::Settings;
         let has_categories = !categories.is_empty();
         let has_tags = !tags.is_empty();
@@ -336,6 +337,21 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
+                    .child(
+                        item(
+                            "search".into(),
+                            IconName::Search,
+                            "search".into(),
+                            0,
+                            search_active,
+                        )
+                        .on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.select(Page::Search, window, cx)
+                            }),
+                        ),
+                    )
+                    .child(divider())
                     .children(statuses)
                     .when(has_categories, |this| {
                         this.child(divider()).children(categories)

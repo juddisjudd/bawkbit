@@ -126,6 +126,68 @@ pub fn state_label(state: State) -> &'static str {
     }
 }
 
+/// A local filter over search results: words to keep, `-words` to drop, and `>1GB` or `<500MB` size bounds.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Refine {
+    words: Vec<String>,
+    excluded: Vec<String>,
+    min: Option<u64>,
+    max: Option<u64>,
+}
+
+impl Refine {
+    pub fn parse(text: &str) -> Self {
+        let mut refine = Refine::default();
+        for token in text.split_whitespace() {
+            let lower = token.to_lowercase();
+            if let Some(size) = lower
+                .strip_prefix(">=")
+                .or_else(|| lower.strip_prefix('>'))
+                .and_then(size)
+            {
+                refine.min = Some(size);
+            } else if let Some(size) = lower
+                .strip_prefix("<=")
+                .or_else(|| lower.strip_prefix('<'))
+                .and_then(size)
+            {
+                refine.max = Some(size);
+            } else if let Some(word) = lower.strip_prefix('-').filter(|word| !word.is_empty()) {
+                refine.excluded.push(word.to_string());
+            } else {
+                refine.words.push(lower);
+            }
+        }
+        refine
+    }
+
+    pub fn matches(&self, title: &str, bytes: u64) -> bool {
+        let title = title.to_lowercase();
+        self.words.iter().all(|word| title.contains(word))
+            && !self.excluded.iter().any(|word| title.contains(word))
+            && self.min.is_none_or(|min| bytes >= min)
+            && self.max.is_none_or(|max| bytes <= max)
+    }
+}
+
+/// "1.5gb", "700mb" or a bare number of megabytes.
+fn size(text: &str) -> Option<u64> {
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let scale: f64 = match unit {
+        "" | "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((number * scale) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +214,18 @@ mod tests {
             save_path: String::new(),
             error: None,
         }
+    }
+
+    #[test]
+    fn refine_keeps_words_drops_minus_words_and_bounds_size() {
+        let refine = Refine::parse("ubuntu -beta >1gb <3GB");
+        let gb = 1024 * 1024 * 1024;
+        assert!(refine.matches("Ubuntu 24.04 Desktop", 2 * gb));
+        assert!(!refine.matches("Ubuntu 25.04 Beta", 2 * gb));
+        assert!(!refine.matches("Ubuntu Server", gb / 2));
+        assert!(!refine.matches("Ubuntu DVD", 4 * gb));
+        assert!(Refine::parse(">700").matches("x", 800 * 1024 * 1024));
+        assert!(Refine::parse("").matches("anything", 0));
     }
 
     #[test]

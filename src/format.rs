@@ -130,6 +130,21 @@ pub fn clock(minutes: u16) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
+/// How long ago, in one short unit: "40m", "5h", "3d", "2mo", "1y".
+pub fn age(unix: Option<i64>, now: i64) -> String {
+    let Some(unix) = unix else {
+        return String::new();
+    };
+    let seconds = (now - unix).max(0);
+    match seconds {
+        0..3600 => format!("{}m", (seconds / 60).max(1)),
+        3600..86_400 => format!("{}h", seconds / 3600),
+        86_400..2_592_000 => format!("{}d", seconds / 86_400),
+        2_592_000..31_536_000 => format!("{}mo", seconds / 2_592_000),
+        _ => format!("{}y", seconds / 31_536_000),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +171,16 @@ mod tests {
         assert_eq!(eta(Some(3 * 3600 + 60)), "3h 01m");
         assert_eq!(eta(Some(2 * 86_400 + 3600)), "2d 1h");
         assert_eq!(eta(Some(500 * 86_400)), "∞");
+    }
+
+    #[test]
+    fn formats_age() {
+        assert_eq!(age(None, 0), "");
+        assert_eq!(age(Some(0), 30), "1m");
+        assert_eq!(age(Some(0), 5 * 3600), "5h");
+        assert_eq!(age(Some(0), 3 * 86_400), "3d");
+        assert_eq!(age(Some(0), 70 * 86_400), "2mo");
+        assert_eq!(age(Some(0), 800 * 86_400), "2y");
     }
 
     #[test]

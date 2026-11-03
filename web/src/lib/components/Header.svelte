@@ -3,6 +3,7 @@
   import ArrowUp from '@lucide/svelte/icons/arrow-up'
   import Funnel from '@lucide/svelte/icons/funnel'
   import Plus from '@lucide/svelte/icons/plus'
+  import Search from '@lucide/svelte/icons/search'
   import SettingsIcon from '@lucide/svelte/icons/settings'
   import Turtle from '@lucide/svelte/icons/turtle'
   import { bytes, speed } from '$lib/format'
@@ -67,6 +68,15 @@
       </button>
     {/if}
 
+    <button
+      type="button"
+      class={['btn', 'ghost', 'icon', 'mobile', app.view === 'search' && 'active']}
+      aria-label="search"
+      aria-pressed={app.view === 'search'}
+      onclick={() => (app.view === 'search' ? (app.view = 'list') : app.openSearch())}
+    >
+      <Search />
+    </button>
     <button
       type="button"
       class={['btn', 'ghost', 'icon', 'filters', (app.status !== 'all' || app.category || app.tag) && 'on']}
@@ -163,7 +173,8 @@
     color: var(--text-strong);
     background: var(--bg-weak-hover);
   }
-  .filters {
+  .filters,
+  .mobile {
     display: none;
   }
   @media (max-width: 720px) {
@@ -184,7 +195,8 @@
     .value {
       min-width: 0;
     }
-    .filters {
+    .filters,
+    .mobile {
       display: inline-flex;
     }
   }

@@ -13,8 +13,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use bawkbit_core::settings::Settings;
-use bawkbit_core::{Action, AddRequest, Core, Details, Preview, Reply, Snapshot, Source};
+use bawkbit_core::settings::{Indexer, Settings};
+use bawkbit_core::{
+    Action, AddRequest, Core, Details, Preview, Reply, SearchReply, SearchRequest, Snapshot, Source,
+};
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -153,6 +155,8 @@ fn router(state: AppState) -> Router {
         .route("/preview", post(preview))
         .route("/actions", post(action))
         .route("/settings", get(get_settings).put(put_settings))
+        .route("/search", post(search))
+        .route("/indexers/test", post(test_indexer))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_login));
     let open = Router::new()
         .route("/session", get(session))
@@ -362,6 +366,26 @@ async fn preview(State(state): State<AppState>, Json(source): Json<Source>) -> A
 
 async fn action(State(state): State<AppState>, Json(action): Json<Action>) -> ApiResult<Reply> {
     Ok(Json(state.core.execute(action).await?))
+}
+
+async fn search(
+    State(state): State<AppState>,
+    Json(request): Json<SearchRequest>,
+) -> ApiResult<SearchReply> {
+    Ok(Json(state.core.search(request).await?))
+}
+
+#[derive(Serialize)]
+struct Tested {
+    message: String,
+}
+
+async fn test_indexer(
+    State(state): State<AppState>,
+    Json(indexer): Json<Indexer>,
+) -> ApiResult<Tested> {
+    let message = state.core.test_indexer(indexer).await?;
+    Ok(Json(Tested { message }))
 }
 
 async fn get_settings(State(state): State<AppState>) -> Json<Settings> {

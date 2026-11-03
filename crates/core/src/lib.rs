@@ -1,6 +1,7 @@
 pub mod api;
 mod engine;
 mod magnet;
+mod search;
 pub mod settings;
 mod store;
 

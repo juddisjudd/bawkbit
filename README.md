@@ -40,6 +40,17 @@ To open magnet links and `.torrent` files from your browser with bawkbit on Wind
 
 To reach it from other devices, keep the address `0.0.0.0` and open `http://<this computer's IP>:8228`. With `127.0.0.1` only this computer can reach it.
 
+### Search
+
+bawkbit searches through [Prowlarr](https://prowlarr.com) or [Jackett](https://github.com/Jackett/Jackett), the indexer managers Sonarr and Radarr use. It ships no site scrapers of its own, so you pick the trackers, and Prowlarr or Jackett keeps them working when the sites change.
+
+1. Open **settings → search** and press **add prowlarr** or **add jackett**.
+2. Type its address, such as `http://tower:9696`, and its API key. Prowlarr shows the key under **settings → general**; Jackett shows it at the top right of its dashboard.
+3. Press **test**. It says how many indexers it found.
+4. Open **search**, type a name and press Enter. Click a result to add it.
+
+Results come from every source you turn on at once. A torrent that several trackers list shows once. Type in the refine box to narrow the results: `-word` leaves a word out, and `>1GB` or `<500MB` limits the size.
+
 ### Without a window
 
 `bawkbitd` is the engine and the web UI on their own. Start it, and it prints a password for the web UI on first start:
@@ -80,6 +91,7 @@ Double-click a torrent to open its folder. Right-click it for everything else.
 ## What it does
 
 - **Adds** magnet links, links to `.torrent` files and `.torrent` files. You see the file list first and pick what to download. Magnet links can also go straight in (**settings → downloads → add magnets without asking**).
+- **Search** your Prowlarr or Jackett, with results from every tracker merged into one list.
 - **Categories** with their own folder, and **tags**. Filter the list by status, category and tag at once.
 - **Speed limits**, with alternative limits behind the turtle in the title bar and a schedule that switches to them.
 - **A queue**: only so many downloads run at once, the rest wait their turn.
@@ -166,6 +178,8 @@ The web UI uses this API, and so can your scripts. Log in with `POST /api/login`
 | `GET /api/torrents/{id}` | one torrent's files, peers, trackers and piece map |
 | `POST /api/preview` | reads a magnet link or `.torrent` file without adding it |
 | `POST /api/torrents` | adds a torrent |
+| `POST /api/search` | searches every turned-on Prowlarr and Jackett |
+| `POST /api/indexers/test` | checks a Prowlarr or Jackett address and key |
 | `POST /api/actions` | pause, resume, remove, set files, categories, tags and the alternative limits |
 | `GET` or `PUT /api/settings` | reads or changes the engine settings |
 

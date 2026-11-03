@@ -1,11 +1,14 @@
 import { SvelteSet } from 'svelte/reactivity'
-import { api, isLink, whenUnauthorized, type Action, type Id, type SessionInfo, type Settings, type Snapshot, type Torrent } from './api'
+import { api, isLink, whenUnauthorized, type Action, type Id, type SearchCategory, type SearchReply, type SearchResult, type SessionInfo, type Settings, type Snapshot, type Torrent } from './api'
+import { COMPARE_RESULTS, parseRefine, refines, type SearchSortKey } from './search'
 import { isRunning } from './states'
 
 export type StatusFilter = 'all' | 'downloading' | 'seeding' | 'done' | 'paused' | 'active' | 'error'
 export type SortKey = 'name' | 'size' | 'progress' | 'down' | 'up' | 'eta' | 'ratio' | 'peers' | 'added'
 export type ThemeChoice = 'system' | 'dark' | 'light'
 export type DetailsTab = 'overview' | 'files' | 'peers' | 'trackers'
+export type View = 'list' | 'search' | 'settings'
+export type SettingsTab = 'downloads' | 'connection' | 'speed' | 'queue' | 'search' | 'web' | 'appearance'
 
 export interface MenuItem {
   label: string
@@ -93,7 +96,8 @@ class App {
   session = $state.raw<SessionInfo | null>(null)
   snapshot = $state.raw<Snapshot | null>(null)
   live = $state<'connecting' | 'live' | 'reconnecting'>('connecting')
-  view = $state<'list' | 'settings'>('list')
+  view = $state<View>('list')
+  settingsTab = $state<SettingsTab>('downloads')
 
   status = $state<StatusFilter>('all')
   category = $state<string | null>(null)
@@ -113,6 +117,15 @@ class App {
   prompt = $state<Prompt | null>(null)
   toasts = $state<Toast[]>([])
   dragging = $state(false)
+
+  searchText = $state('')
+  searchCategory = $state<SearchCategory>('all')
+  searching = $state(false)
+  searchReply = $state.raw<SearchReply | null>(null)
+  searchError = $state('')
+  refine = $state('')
+  searchSort = $state<{ key: SearchSortKey; desc: boolean }>(stored('searchSort', { key: 'seeds', desc: true }))
+  private searchAttempt = 0
 
   theme = $state<ThemeChoice>(stored('theme', 'system'))
   defaults = $state.raw<Settings | null>(null)
@@ -148,6 +161,20 @@ class App {
   })
 
   current = $derived(this.torrents.find((t) => t.id === this.focused) ?? null)
+
+  /** Unknown until the settings load, so the search box shows rather than a false empty state. */
+  hasIndexers = $derived(this.defaults === null || (this.defaults.indexers ?? []).some((indexer) => indexer.enabled))
+
+  known = $derived(new Set(this.torrents.map((t) => t.id)))
+
+  results = $derived.by(() => {
+    const reply = this.searchReply
+    if (!reply) return []
+    const refine = parseRefine(this.refine)
+    const compare = COMPARE_RESULTS[this.searchSort.key]
+    const direction = this.searchSort.desc ? -1 : 1
+    return reply.results.filter((r) => refines(r, refine)).sort((a, b) => direction * compare(a, b) || COMPARE_RESULTS.seeds(b, a))
+  })
 
   private source: EventSource | null = null
   private retry: ReturnType<typeof setTimeout> | null = null
@@ -270,6 +297,7 @@ class App {
   }
 
   filterBy(status: StatusFilter, category: string | null = null, tag: string | null = null): void {
+    this.view = 'list'
     this.status = status
     this.category = category
     this.tag = tag
@@ -397,6 +425,53 @@ class App {
 
   openAdd(intent: AddIntent = {}): void {
     this.adding = intent
+  }
+
+  openSettings(tab: SettingsTab): void {
+    this.settingsTab = tab
+    this.view = 'settings'
+    this.filtersOpen = false
+  }
+
+  openSearch(): void {
+    this.view = 'search'
+    this.filtersOpen = false
+  }
+
+  async search(): Promise<void> {
+    const query = this.searchText.trim()
+    if (!query) return
+    const mine = ++this.searchAttempt
+    this.searching = true
+    this.searchError = ''
+    try {
+      const reply = await api.search({ query, category: this.searchCategory })
+      if (mine !== this.searchAttempt) return
+      this.searchReply = reply
+      this.refine = ''
+    } catch (error) {
+      if (mine !== this.searchAttempt) return
+      this.searchError = (error as Error).message
+      this.searchReply = null
+    } finally {
+      if (mine === this.searchAttempt) this.searching = false
+    }
+  }
+
+  setSearchSort(key: SearchSortKey): void {
+    this.searchSort = this.searchSort.key === key ? { key, desc: !this.searchSort.desc } : { key, desc: key !== 'title' && key !== 'source' }
+    store('searchSort', this.searchSort)
+  }
+
+  /** Shows a torrent already in the list. */
+  reveal(id: Id): void {
+    this.filterBy('all')
+    this.click(id, { ctrlKey: false, metaKey: false, shiftKey: false })
+  }
+
+  pickResult(result: SearchResult): void {
+    if (result.info_hash && this.known.has(result.info_hash)) this.reveal(result.info_hash)
+    else this.openAdd({ link: result.link })
   }
 
   toast(text: string, error = false): void {

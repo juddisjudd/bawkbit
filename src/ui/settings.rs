@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use bawkbit_core::Settings;
+use bawkbit_core::settings::{Indexer, IndexerKind};
 use bawkbit_web::Status as WebStatus;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, InputState};
@@ -22,17 +23,19 @@ enum Tab {
     Connection,
     Speed,
     Queue,
+    Search,
     Web,
     Appearance,
     About,
 }
 
 impl Tab {
-    const ALL: [Tab; 7] = [
+    const ALL: [Tab; 8] = [
         Tab::Downloads,
         Tab::Connection,
         Tab::Speed,
         Tab::Queue,
+        Tab::Search,
         Tab::Web,
         Tab::Appearance,
         Tab::About,
@@ -44,6 +47,7 @@ impl Tab {
             Tab::Connection => "connection",
             Tab::Speed => "speed",
             Tab::Queue => "queue",
+            Tab::Search => "search",
             Tab::Web => "web ui",
             Tab::Appearance => "appearance",
             Tab::About => "about",
@@ -56,6 +60,7 @@ impl Tab {
             Tab::Connection => IconName::Network,
             Tab::Speed => IconName::Gauge,
             Tab::Queue => IconName::Hourglass,
+            Tab::Search => IconName::Search,
             Tab::Web => IconName::Globe,
             Tab::Appearance => IconName::Palette,
             Tab::About => IconName::Info,
@@ -97,6 +102,20 @@ pub struct SettingsView {
     inputs: HashMap<Field, Entity<InputState>>,
     errors: HashMap<Field, &'static str>,
     password: Entity<InputState>,
+    indexers: Vec<IndexerRow>,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// One Prowlarr or Jackett in the search tab, with its own text boxes.
+struct IndexerRow {
+    id: String,
+    kind: IndexerKind,
+    enabled: bool,
+    name: Entity<InputState>,
+    url: Entity<InputState>,
+    key: Entity<InputState>,
+    test: Option<Result<String, String>>,
+    testing: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -172,7 +191,8 @@ impl SettingsView {
                 .placeholder("new password")
                 .masked(true)
         });
-        Self {
+        let stored = engine.read(cx).core().settings().indexers;
+        let mut this = Self {
             engine,
             tab: Tab::Downloads,
             theme: config.theme.clone().into(),
@@ -181,8 +201,131 @@ impl SettingsView {
             inputs,
             errors: HashMap::new(),
             password,
+            indexers: Vec::new(),
+            _subscriptions: subscriptions,
+        };
+        this.indexers = stored
+            .iter()
+            .map(|indexer| this.indexer_row(indexer, window, cx))
+            .collect();
+        this
+    }
+
+    pub fn show_search(&mut self, cx: &mut Context<Self>) {
+        self.tab = Tab::Search;
+        cx.notify();
+    }
+
+    fn indexer_row(
+        &self,
+        indexer: &Indexer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> IndexerRow {
+        let key_hint = if indexer.api_key.is_empty() {
+            "api key"
+        } else {
+            "api key saved; type a new one to replace it"
+        };
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(indexer.kind.label())
+                .default_value(indexer.name.clone())
+        });
+        let url = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(indexer.kind.default_url())
+                .default_value(indexer.url.clone())
+        });
+        let key = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(key_hint)
+                .masked(true)
+        });
+        let subscriptions = [&name, &url, &key]
+            .into_iter()
+            .map(|input| {
+                cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                        this.save_indexers(window, cx);
+                    }
+                })
+            })
+            .collect();
+        IndexerRow {
+            id: indexer.id.clone(),
+            kind: indexer.kind,
+            enabled: indexer.enabled,
+            name,
+            url,
+            key,
+            test: None,
+            testing: false,
             _subscriptions: subscriptions,
         }
+    }
+
+    fn indexer_from_row(row: &IndexerRow, cx: &App) -> Indexer {
+        let value = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
+        Indexer {
+            id: row.id.clone(),
+            kind: row.kind,
+            name: value(&row.name),
+            url: value(&row.url),
+            api_key: value(&row.key),
+            has_key: false,
+            enabled: row.enabled,
+        }
+    }
+
+    /// Saves every indexer; a blank key keeps the stored one.
+    fn save_indexers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut settings = self.settings(cx);
+        settings.indexers = self
+            .indexers
+            .iter()
+            .map(|row| Self::indexer_from_row(row, cx))
+            .collect();
+        self.save(settings, window, cx);
+    }
+
+    fn add_indexer(&mut self, kind: IndexerKind, window: &mut Window, cx: &mut Context<Self>) {
+        let row = self.indexer_row(&Indexer::new(kind), window, cx);
+        let focus = row.key.focus_handle(cx);
+        self.indexers.push(row);
+        self.save_indexers(window, cx);
+        window.focus(&focus, cx);
+    }
+
+    fn remove_indexer(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.indexers.retain(|row| row.id != id);
+        self.save_indexers(window, cx);
+    }
+
+    fn test_indexer(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.indexers.iter_mut().find(|row| row.id == id) else {
+            return;
+        };
+        row.testing = true;
+        row.test = None;
+        let indexer = Self::indexer_from_row(row, cx);
+        let id = id.to_string();
+        let job = self
+            .engine
+            .read(cx)
+            .run(move |core| async move { core.test_indexer(indexer).await });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = job.await.map_err(|err| format!("{err:#}"));
+            let _ = this.update(cx, |this, cx| {
+                if let Some(row) = this.indexers.iter_mut().find(|row| row.id == id) {
+                    row.testing = false;
+                    row.test = Some(result);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn settings(&self, cx: &App) -> Settings {
@@ -549,6 +692,150 @@ impl SettingsView {
             ))
     }
 
+    fn render_search(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let cards: Vec<_> = self
+            .indexers
+            .iter()
+            .map(|row| {
+                let (test_id, remove_id, toggle_id) =
+                    (row.id.clone(), row.id.clone(), row.id.clone());
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(p.border_weak)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(72.))
+                                    .flex_none()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(p.text_strong)
+                                    .child(row.kind.label()),
+                            )
+                            .child(
+                                div()
+                                    .w(px(180.))
+                                    .flex_none()
+                                    .child(kit::input(&row.name).small()),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                Switch::new(SharedString::from(format!("indexer-on-{}", row.id)))
+                                    .checked(row.enabled)
+                                    .tooltip("search this one")
+                                    .on_click(cx.listener(
+                                        move |this, checked: &bool, window, cx| {
+                                            if let Some(row) = this
+                                                .indexers
+                                                .iter_mut()
+                                                .find(|row| row.id == toggle_id)
+                                            {
+                                                row.enabled = *checked;
+                                            }
+                                            this.save_indexers(window, cx);
+                                            cx.notify();
+                                        },
+                                    )),
+                            )
+                            .child(
+                                kit::button(
+                                    SharedString::from(format!("indexer-test-{}", row.id)),
+                                    cx,
+                                )
+                                .small()
+                                .label("test")
+                                .loading(row.testing)
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.test_indexer(&test_id, window, cx)
+                                    },
+                                )),
+                            )
+                            .child(
+                                kit::icon_button(
+                                    SharedString::from(format!("indexer-remove-{}", row.id)),
+                                    IconName::Trash,
+                                    "remove",
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.remove_indexer(&remove_id, window, cx)
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(div().flex_1().child(kit::input(&row.url).small()))
+                            .child(
+                                div()
+                                    .w(px(280.))
+                                    .flex_none()
+                                    .child(kit::input(&row.key).small().mask_toggle()),
+                            ),
+                    )
+                    .when_some(row.test.clone(), |this, test| {
+                        let (color, text) = match test {
+                            Ok(message) => (p.success, message),
+                            Err(error) => (p.danger, error),
+                        };
+                        this.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .text_size(px(12.))
+                                .text_color(color)
+                                .child(kit::dot(color))
+                                .child(text),
+                        )
+                    })
+            })
+            .collect();
+        panel()
+            .max_w(px(820.))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(p.text_weak)
+                    .child("search asks these. the api key is under settings, general in prowlarr, and at the top right of jackett's dashboard."),
+            )
+            .children(cards)
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        kit::button("add-prowlarr", cx)
+                            .small()
+                            .icon(Icon::new(IconName::Plus))
+                            .label("add prowlarr")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_indexer(IndexerKind::Prowlarr, window, cx)
+                            })),
+                    )
+                    .child(
+                        kit::button("add-jackett", cx)
+                            .small()
+                            .icon(Icon::new(IconName::Plus))
+                            .label("add jackett")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.add_indexer(IndexerKind::Jackett, window, cx)
+                            })),
+                    ),
+            )
+    }
+
     fn render_queue(&self, p: &Palette) -> Div {
         panel()
             .child(field(
@@ -897,6 +1184,7 @@ impl Render for SettingsView {
             Tab::Connection => self.render_connection(&s, &p, cx),
             Tab::Speed => self.render_speed(&s, &p, cx),
             Tab::Queue => self.render_queue(&p),
+            Tab::Search => self.render_search(&p, cx),
             Tab::Web => self.render_web(&s, &p, cx),
             Tab::Appearance => self.render_appearance(&p, cx),
             Tab::About => self.render_about(&p, cx),

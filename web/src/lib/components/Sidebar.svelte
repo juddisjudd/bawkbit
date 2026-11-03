@@ -9,6 +9,7 @@
   import Layers from '@lucide/svelte/icons/layers'
   import Network from '@lucide/svelte/icons/network'
   import Pause from '@lucide/svelte/icons/pause'
+  import Search from '@lucide/svelte/icons/search'
   import Tag from '@lucide/svelte/icons/tag'
   import type { Component } from 'svelte'
   import { bytes, count } from '$lib/format'
@@ -81,10 +82,17 @@
 
 <nav class={['sidebar', app.filtersOpen && 'open']} aria-label="filters">
   <div class="group">
+    <button type="button" class={['item', app.view === 'search' && 'active']} aria-current={app.view === 'search'} onclick={() => app.openSearch()}>
+      <Search size={14} />
+      <span class="label">search</span>
+    </button>
+  </div>
+
+  <div class="group">
     {#each statuses as s (s.id)}
       {@const n = app.counts.statuses[s.id]}
       {#if s.id !== 'error' || n > 0}
-        {@const active = app.status === s.id && !app.category && !app.tag}
+        {@const active = app.view === 'list' && app.status === s.id && !app.category && !app.tag}
         <button type="button" class={['item', active && 'active', s.id === 'error' && 'danger']} aria-current={active} onclick={() => app.filterBy(s.id)}>
           <s.icon size={14} />
           <span class="label">{s.label}</span>
@@ -97,7 +105,7 @@
   {#if categories.length}
     <div class="group">
       {#each categories as c (c.name)}
-        {@const active = app.category === c.name}
+        {@const active = app.view === 'list' && app.category === c.name}
         <button
           type="button"
           class={['item', active && 'active']}
@@ -117,7 +125,7 @@
   {#if tags.length}
     <div class="group">
       {#each tags as tag (tag)}
-        {@const active = app.tag === tag}
+        {@const active = app.view === 'list' && app.tag === tag}
         <button
           type="button"
           class={['item', active && 'active']}

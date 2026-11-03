@@ -31,6 +31,8 @@ pub struct Settings {
     /// A folder whose .torrent files are added on their own; empty turns it off.
     pub watch_dir: String,
     pub web: Web,
+    /// Prowlarr and Jackett servers that search answers come from.
+    pub indexers: Vec<Indexer>,
 }
 
 impl Default for Settings {
@@ -53,6 +55,7 @@ impl Default for Settings {
             seed_minutes: 0,
             watch_dir: String::new(),
             web: Web::default(),
+            indexers: Vec::new(),
         }
     }
 }
@@ -128,6 +131,66 @@ impl Default for Web {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexerKind {
+    #[default]
+    Prowlarr,
+    Jackett,
+}
+
+impl IndexerKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            IndexerKind::Prowlarr => "prowlarr",
+            IndexerKind::Jackett => "jackett",
+        }
+    }
+
+    pub fn default_url(self) -> &'static str {
+        match self {
+            IndexerKind::Prowlarr => "http://localhost:9696",
+            IndexerKind::Jackett => "http://localhost:9117",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Indexer {
+    pub id: String,
+    pub kind: IndexerKind,
+    pub name: String,
+    /// The address its own web page opens at, with any base path, such as http://tower:9696.
+    pub url: String,
+    /// Never sent to clients; an empty key from a client keeps the stored one.
+    pub api_key: String,
+    /// Tells a client a key is stored without sending it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub has_key: bool,
+    pub enabled: bool,
+}
+
+impl Indexer {
+    pub fn new(kind: IndexerKind) -> Self {
+        Self {
+            id: new_id(),
+            kind,
+            name: kind.label().into(),
+            url: kind.default_url().into(),
+            api_key: String::new(),
+            has_key: false,
+            enabled: true,
+        }
+    }
+}
+
+fn new_id() -> String {
+    let mut bytes = [0u8; 6];
+    let _ = getrandom::fill(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 impl Settings {
     pub fn load(path: &Path) -> Option<Self> {
         let bytes = std::fs::read(path).ok()?;
@@ -144,13 +207,32 @@ impl Settings {
         let mut copy = self.clone();
         copy.web.password_hash.clear();
         copy.web.password = None;
+        for indexer in &mut copy.indexers {
+            indexer.has_key = !indexer.api_key.is_empty();
+            indexer.api_key.clear();
+        }
         copy
     }
 
     /// Takes a client's settings, keeping what clients never see.
     pub fn merge_from_client(&self, mut incoming: Settings) -> Settings {
         incoming.web.password_hash = self.web.password_hash.clone();
+        for indexer in &mut incoming.indexers {
+            if indexer.id.is_empty() {
+                indexer.id = new_id();
+            }
+            if indexer.api_key.is_empty()
+                && let Some(stored) = self.indexers.iter().find(|stored| stored.id == indexer.id)
+            {
+                indexer.api_key = stored.api_key.clone();
+            }
+            indexer.has_key = false;
+        }
         incoming
+    }
+
+    pub fn indexer(&self, id: &str) -> Option<&Indexer> {
+        self.indexers.iter().find(|indexer| indexer.id == id)
     }
 
     pub fn effective_limits(&self) -> (u64, u64) {
@@ -223,6 +305,24 @@ mod tests {
             settings.merge_from_client(public).web.password_hash,
             "secret"
         );
+    }
+
+    #[test]
+    fn clients_never_see_indexer_keys_and_keep_them_by_sending_none() {
+        let mut settings = Settings::default();
+        let mut indexer = Indexer::new(IndexerKind::Jackett);
+        indexer.api_key = "key".into();
+        settings.indexers.push(indexer);
+        let mut public = settings.public();
+        assert!(public.indexers[0].api_key.is_empty());
+        assert!(public.indexers[0].has_key);
+        let mut added = Indexer::new(IndexerKind::Prowlarr);
+        added.id.clear();
+        public.indexers.push(added);
+        let merged = settings.merge_from_client(public);
+        assert_eq!(merged.indexers[0].api_key, "key");
+        assert!(!merged.indexers[1].id.is_empty());
+        assert!(merged.indexers.iter().all(|indexer| !indexer.has_key));
     }
 
     #[test]

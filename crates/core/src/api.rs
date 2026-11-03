@@ -240,6 +240,111 @@ pub enum Reply {
     Settings(Box<Settings>),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchCategory {
+    #[default]
+    All,
+    Movies,
+    Tv,
+    Music,
+    Books,
+    Software,
+    Games,
+    Other,
+}
+
+impl SearchCategory {
+    pub const ALL: [SearchCategory; 8] = [
+        SearchCategory::All,
+        SearchCategory::Movies,
+        SearchCategory::Tv,
+        SearchCategory::Music,
+        SearchCategory::Books,
+        SearchCategory::Software,
+        SearchCategory::Games,
+        SearchCategory::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchCategory::All => "all",
+            SearchCategory::Movies => "movies",
+            SearchCategory::Tv => "tv",
+            SearchCategory::Music => "music",
+            SearchCategory::Books => "books",
+            SearchCategory::Software => "software",
+            SearchCategory::Games => "games",
+            SearchCategory::Other => "other",
+        }
+    }
+
+    /// The Newznab category numbers indexers file this under.
+    pub fn newznab(self) -> &'static [u32] {
+        match self {
+            SearchCategory::All => &[],
+            SearchCategory::Movies => &[2000],
+            SearchCategory::Tv => &[5000],
+            SearchCategory::Music => &[3000],
+            SearchCategory::Books => &[7000],
+            SearchCategory::Software => &[4000],
+            SearchCategory::Games => &[1000, 4050],
+            SearchCategory::Other => &[8000],
+        }
+    }
+
+    pub fn from_newznab(id: u32) -> Self {
+        match id {
+            4050..=4059 | 1000..=1999 => SearchCategory::Games,
+            2000..=2999 => SearchCategory::Movies,
+            3000..=3999 => SearchCategory::Music,
+            4000..=4999 => SearchCategory::Software,
+            5000..=5999 => SearchCategory::Tv,
+            7000..=7999 => SearchCategory::Books,
+            _ => SearchCategory::Other,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchRequest {
+    pub query: String,
+    #[serde(default)]
+    pub category: SearchCategory,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub title: String,
+    pub size: u64,
+    pub seeds: Option<u32>,
+    pub peers: Option<u32>,
+    /// Unix seconds.
+    pub published: Option<i64>,
+    /// The trackers that list it, as the indexer names them.
+    pub source: String,
+    /// The Prowlarr or Jackett server it came through.
+    pub via: String,
+    /// A magnet link or a link to the .torrent file; add it as `Source::Link`.
+    pub link: String,
+    pub info_url: Option<String>,
+    pub info_hash: Option<String>,
+    pub category: SearchCategory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFailure {
+    pub source: String,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SearchReply {
+    /// Most seeds first; a torrent listed by several trackers shows once.
+    pub results: Vec<SearchResult>,
+    pub failures: Vec<SearchFailure>,
+}
+
 mod base64_bytes {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;

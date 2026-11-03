@@ -180,6 +180,53 @@ export interface Settings {
   seed_minutes: number
   watch_dir: string
   web: Web
+  indexers: Indexer[]
+}
+
+export type IndexerKind = 'prowlarr' | 'jackett'
+
+export interface Indexer {
+  id: string
+  kind: IndexerKind
+  name: string
+  url: string
+  /** Always empty from the server; send empty to keep the stored key. */
+  api_key: string
+  has_key: boolean
+  enabled: boolean
+}
+
+export type SearchCategory = 'all' | 'movies' | 'tv' | 'music' | 'books' | 'software' | 'games' | 'other'
+
+export const SEARCH_CATEGORIES: SearchCategory[] = ['all', 'movies', 'tv', 'music', 'books', 'software', 'games', 'other']
+
+export interface SearchRequest {
+  query: string
+  category: SearchCategory
+}
+
+export interface SearchResult {
+  title: string
+  size: number
+  seeds: number | null
+  peers: number | null
+  published: number | null
+  source: string
+  via: string
+  link: string
+  info_url: string | null
+  info_hash: string | null
+  category: SearchCategory
+}
+
+export interface SearchFailure {
+  source: string
+  error: string
+}
+
+export interface SearchReply {
+  results: SearchResult[]
+  failures: SearchFailure[]
 }
 
 export interface SessionInfo {
@@ -243,7 +290,9 @@ export const api = {
   add: (body: AddRequest) => request<{ id: Id }>('POST', '/torrents', body),
   act: (action: Action) => request<Reply>('POST', '/actions', action),
   settings: () => request<Settings>('GET', '/settings'),
-  saveSettings: (settings: Settings) => request<Settings>('PUT', '/settings', settings)
+  saveSettings: (settings: Settings) => request<Settings>('PUT', '/settings', settings),
+  search: (body: SearchRequest) => request<SearchReply>('POST', '/search', body),
+  testIndexer: (indexer: Indexer) => request<{ message: string }>('POST', '/indexers/test', indexer)
 }
 
 export function fileToBase64(file: Blob): Promise<string> {

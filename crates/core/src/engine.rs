@@ -21,7 +21,8 @@ use tokio::sync::watch;
 
 use crate::api::*;
 use crate::magnet;
-use crate::settings::Settings;
+use crate::search;
+use crate::settings::{Indexer, Settings};
 use crate::store::{Entry, Store};
 
 const HISTORY: usize = 300;
@@ -98,6 +99,7 @@ struct Inner {
     snapshot: watch::Sender<Arc<Snapshot>>,
     rev: AtomicU64,
     rebuilding: tokio::sync::Mutex<()>,
+    http: reqwest::Client,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -137,6 +139,7 @@ impl Core {
                 snapshot,
                 rev: AtomicU64::new(0),
                 rebuilding: tokio::sync::Mutex::new(()),
+                http: search::client(),
             }),
         };
         core.tick().await;
@@ -427,6 +430,15 @@ impl Core {
 
     /// Gets a torrent's metadata into the resolved cache and returns its id.
     async fn resolve(&self, source: Source) -> Result<Id> {
+        let source = match source {
+            Source::Link(link) if is_web_link(&link) => {
+                match search::fetch_link(&self.inner.http, &link).await? {
+                    search::Fetched::Magnet(magnet) => Source::Link(magnet),
+                    search::Fetched::Torrent(bytes) => Source::File(bytes),
+                }
+            }
+            other => other,
+        };
         if let Source::Link(link) = &source
             && let Some(info) = magnet::parse(link)
             && lock(&self.inner.resolved).contains_key(&info.id)
@@ -638,6 +650,28 @@ impl Core {
                 })
                 .count()
                 >= max
+    }
+
+    /// Asks every turned-on Prowlarr and Jackett at once.
+    pub async fn search(&self, request: SearchRequest) -> Result<SearchReply> {
+        if request.query.trim().is_empty() {
+            bail!("type something to search for");
+        }
+        let indexers = self.settings().indexers;
+        if !indexers.iter().any(|indexer| indexer.enabled) {
+            bail!("add prowlarr or jackett under settings, search");
+        }
+        Ok(search::search(&self.inner.http, &indexers, &request).await)
+    }
+
+    /// Checks an indexer's address and key; a blank key means the stored one.
+    pub async fn test_indexer(&self, mut indexer: Indexer) -> Result<String> {
+        if indexer.api_key.trim().is_empty()
+            && let Some(stored) = self.settings().indexer(&indexer.id)
+        {
+            indexer.api_key = stored.api_key.clone();
+        }
+        search::test(&self.inner.http, &indexer).await
     }
 
     pub fn details(&self, id: &str) -> Result<Details> {
@@ -1121,6 +1155,11 @@ fn peer_id() -> Id20 {
         *slot = ALPHABET[byte as usize % ALPHABET.len()];
     }
     Id20::new(id)
+}
+
+fn is_web_link(link: &str) -> bool {
+    let link = link.trim().to_ascii_lowercase();
+    link.starts_with("http://") || link.starts_with("https://")
 }
 
 fn bps(limit: u64) -> Option<NonZeroU32> {

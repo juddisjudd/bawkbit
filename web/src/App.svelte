@@ -6,6 +6,7 @@
   import Header from '$lib/components/Header.svelte'
   import Login from '$lib/components/Login.svelte'
   import PromptDialog from '$lib/components/PromptDialog.svelte'
+  import SearchPage from '$lib/components/SearchPage.svelte'
   import Settings from '$lib/components/Settings.svelte'
   import Sidebar from '$lib/components/Sidebar.svelte'
   import Toasts from '$lib/components/Toasts.svelte'
@@ -15,6 +16,7 @@
 
   let width = $state(1280)
   let list = $state<ReturnType<typeof TorrentList>>()
+  let searchPage = $state<ReturnType<typeof SearchPage>>()
   let dragDepth = 0
 
   const compact = $derived(width <= 720)
@@ -32,10 +34,18 @@
       if (app.filtersOpen) app.filtersOpen = false
       else if (app.detailsOpen) app.detailsOpen = false
       else if (app.view === 'settings') app.view = 'list'
-      else app.clearSelection()
+      else if (app.view === 'search') {
+        if (!typing(event.target)) app.view = 'list'
+      } else app.clearSelection()
       return
     }
-    if (typing(event.target) || app.view !== 'list') return
+    if (typing(event.target)) return
+    if (app.view === 'search' && event.key === '/') {
+      event.preventDefault()
+      searchPage?.focusBox()
+      return
+    }
+    if (app.view !== 'list') return
     if (event.key === '/' || ((event.ctrlKey || event.metaKey) && event.key === 'f')) {
       event.preventDefault()
       list?.focusFilter()
@@ -104,16 +114,20 @@
   <div class="app">
     <Header />
     <div class="body">
-      {#if app.view === 'list'}
+      {#if app.view === 'settings'}
+        <main class="main"><Settings /></main>
+      {:else}
         <Sidebar />
         <main class="main">
-          <TorrentList bind:this={list} {compact} />
-          {#if app.detailsOpen && app.focused}
-            <Details {compact} />
+          {#if app.view === 'search'}
+            <SearchPage bind:this={searchPage} {compact} />
+          {:else}
+            <TorrentList bind:this={list} {compact} />
+            {#if app.detailsOpen && app.focused}
+              <Details {compact} />
+            {/if}
           {/if}
         </main>
-      {:else}
-        <main class="main"><Settings /></main>
       {/if}
     </div>
   </div>

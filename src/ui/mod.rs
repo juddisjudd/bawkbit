@@ -4,6 +4,7 @@ mod details;
 mod filter;
 mod kit;
 mod list;
+mod search;
 mod settings;
 
 use bawkbit_core::{Action, AddRequest, Source};
@@ -20,11 +21,13 @@ use add::{AddDone, AddView};
 use details::{DetailsEvent, DetailsView};
 use filter::Status;
 use list::{ListEvent, TorrentList};
+use search::{SearchEvent, SearchView};
 use settings::{SettingsEvent, SettingsView};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
     Torrents,
+    Search,
     Settings,
 }
 
@@ -54,6 +57,7 @@ pub struct Workspace {
     page: Page,
     list: Entity<TorrentList>,
     details: Entity<DetailsView>,
+    search: Entity<SearchView>,
     settings: Entity<SettingsView>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
@@ -73,12 +77,14 @@ impl Workspace {
 
         let list = cx.new(|cx| TorrentList::new(engine.clone(), &config, window, cx));
         let details = cx.new(|cx| DetailsView::new(engine.clone(), cx));
+        let search = cx.new(|cx| SearchView::new(engine.clone(), window, cx));
         let settings = cx.new(|cx| SettingsView::new(engine.clone(), &config, window, cx));
 
         let subscriptions = vec![
             cx.observe(&engine, |_, _, cx| cx.notify()),
             cx.subscribe_in(&list, window, Self::on_list),
             cx.subscribe_in(&settings, window, Self::on_settings),
+            cx.subscribe_in(&search, window, Self::on_search),
             cx.subscribe(&details, |this, _, _: &DetailsEvent, cx| {
                 this.list.update(cx, |list, cx| list.clear_focus(cx));
             }),
@@ -108,6 +114,7 @@ impl Workspace {
             page: Page::Torrents,
             list,
             details,
+            search,
             settings,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
@@ -142,6 +149,28 @@ impl Workspace {
             ListEvent::Add => self.open_add(None, window, cx),
         }
         cx.notify();
+    }
+
+    fn on_search(
+        &mut self,
+        _: &Entity<SearchView>,
+        event: &SearchEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            SearchEvent::Add(link) => self.add_source(Source::Link(link.clone()), window, cx),
+            SearchEvent::Reveal(id) => {
+                let id = id.clone();
+                self.list.update(cx, |list, cx| list.reveal(id, cx));
+                self.select(Page::Torrents, window, cx);
+            }
+            SearchEvent::Configure => {
+                self.settings
+                    .update(cx, |settings, cx| settings.show_search(cx));
+                self.select(Page::Settings, window, cx);
+            }
+        }
     }
 
     fn on_settings(
@@ -253,8 +282,13 @@ impl Workspace {
 
     fn select(&mut self, page: Page, window: &mut Window, cx: &mut Context<Self>) {
         self.page = page;
-        if page == Page::Torrents {
-            window.focus(&self.focus, cx);
+        match page {
+            Page::Torrents => window.focus(&self.focus, cx),
+            Page::Search => {
+                let focus = self.search.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+            Page::Settings => {}
         }
         cx.notify();
     }
@@ -338,6 +372,7 @@ impl Render for Workspace {
 
         let content = match self.page {
             Page::Settings => self.settings.clone().into_any_element(),
+            Page::Search => self.search.clone().into_any_element(),
             Page::Torrents => v_resizable("split")
                 .child(
                     resizable_panel()

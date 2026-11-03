@@ -6,20 +6,23 @@
   import LogOut from '@lucide/svelte/icons/log-out'
   import Network from '@lucide/svelte/icons/network'
   import Palette from '@lucide/svelte/icons/palette'
+  import Plus from '@lucide/svelte/icons/plus'
+  import Search from '@lucide/svelte/icons/search'
+  import Trash from '@lucide/svelte/icons/trash-2'
   import type { Component } from 'svelte'
-  import { api, type Settings } from '$lib/api'
+  import { api, type Indexer, type IndexerKind, type Settings } from '$lib/api'
   import { limitBytes, limitUnit, limitValue } from '$lib/format'
-  import { app, type ThemeChoice } from '$lib/state.svelte'
+  import { app, type SettingsTab, type ThemeChoice } from '$lib/state.svelte'
   import Checkbox from './Checkbox.svelte'
 
-  type Tab = 'downloads' | 'connection' | 'speed' | 'queue' | 'web' | 'appearance'
   type LimitKey = 'down_limit' | 'up_limit' | 'alt_down_limit' | 'alt_up_limit'
 
-  const tabs: { id: Tab; label: string; icon: Component<{ size?: number }> }[] = [
+  const tabs: { id: SettingsTab; label: string; icon: Component<{ size?: number }> }[] = [
     { id: 'downloads', label: 'downloads', icon: Download },
     { id: 'connection', label: 'connection', icon: Network },
     { id: 'speed', label: 'speed', icon: Gauge },
     { id: 'queue', label: 'queue', icon: ListOrdered },
+    { id: 'search', label: 'search', icon: Search },
     { id: 'web', label: 'web UI', icon: Globe },
     { id: 'appearance', label: 'appearance', icon: Palette }
   ]
@@ -31,7 +34,6 @@
   const days = ['m', 't', 'w', 't', 'f', 's', 's']
   const dayNames = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 
-  let tab = $state<Tab>('downloads')
   let draft = $state<Settings | null>(null)
   let units = $state<Record<LimitKey, 'k' | 'm'>>({ down_limit: 'm', up_limit: 'm', alt_down_limit: 'm', alt_up_limit: 'k' })
   let status = $state<{ text: string; error: boolean }>({ text: '', error: false })
@@ -137,6 +139,36 @@
     }
   }
 
+  const DEFAULT_URL: Record<IndexerKind, string> = { prowlarr: 'http://localhost:9696', jackett: 'http://localhost:9117' }
+  let tests = $state<Record<string, { text: string; error: boolean; busy: boolean }>>({})
+
+  function addIndexer(kind: IndexerKind): void {
+    const indexer: Indexer = { id: '', kind, name: kind, url: DEFAULT_URL[kind], api_key: '', has_key: false, enabled: true }
+    save((s) => s.indexers.push(indexer))
+  }
+
+  function editIndexer(ix: number, change: (indexer: Indexer) => void): void {
+    save((s) => {
+      const indexer = s.indexers[ix]
+      if (indexer) change(indexer)
+    })
+  }
+
+  async function testIndexer(ix: number): Promise<void> {
+    if (!draft) return
+    await queue
+    const indexer = draft.indexers[ix]
+    if (!indexer) return
+    const key = indexer.id || String(ix)
+    tests[key] = { text: 'testing…', error: false, busy: true }
+    try {
+      const { message } = await api.testIndexer($state.snapshot(indexer))
+      tests[key] = { text: message, error: false, busy: false }
+    } catch (err) {
+      tests[key] = { text: (err as Error).message, error: true, busy: false }
+    }
+  }
+
   function changePassword(event: SubmitEvent): void {
     event.preventDefault()
     if (password.length < 8) {
@@ -152,7 +184,7 @@
 <div class="page">
   <nav class="tabs" aria-label="settings">
     {#each tabs as t (t.id)}
-      <button type="button" class={['tab', tab === t.id && 'active']} aria-current={tab === t.id} onclick={() => (tab = t.id)}>
+      <button type="button" class={['tab', app.settingsTab === t.id && 'active']} aria-current={app.settingsTab === t.id} onclick={() => (app.settingsTab = t.id)}>
         <t.icon size={14} />{t.label}
       </button>
     {/each}
@@ -167,7 +199,7 @@
 
     {#if !draft}
       <p class="muted">{status.error ? '' : 'loading…'}</p>
-    {:else if tab === 'downloads'}
+    {:else if app.settingsTab === 'downloads'}
       <label class="field">
         <span class="label">folder</span>
         <input class="input" spellcheck="false" value={draft.download_dir} onchange={(e) => save((s) => (s.download_dir = e.currentTarget.value.trim()))} />
@@ -188,7 +220,7 @@
       <div class="checks">
         <Checkbox checked={draft.start_paused} label="add torrents paused" onchange={(v) => save((s) => (s.start_paused = v))} />
       </div>
-    {:else if tab === 'connection'}
+    {:else if app.settingsTab === 'connection'}
       <label class="row">
         <span>listening port</span>
         <input class="input narrow num" type="number" min="1" max="65535" value={draft.listen_port} onchange={(e) => setNumber('listen_port', e.currentTarget.value, 1, 65535, 'port')} />
@@ -212,7 +244,7 @@
       {#if app.snapshot && !app.snapshot.totals.port}
         <p class="hint warn">bawkbit is not listening for incoming peers. another program may be using the port.</p>
       {/if}
-    {:else if tab === 'speed'}
+    {:else if app.settingsTab === 'speed'}
       {@render limit('down_limit', 'download')}
       {@render limit('up_limit', 'upload')}
       <h3>slow mode</h3>
@@ -242,7 +274,7 @@
           </div>
         </div>
       {/if}
-    {:else if tab === 'queue'}
+    {:else if app.settingsTab === 'queue'}
       <label class="row">
         <span>downloads at once</span>
         <input
@@ -272,7 +304,65 @@
           onchange={(e) => setNumber('seed_minutes', e.currentTarget.value, 0, 5256000, 'minutes')}
         />
       </label>
-    {:else if tab === 'web'}
+    {:else if app.settingsTab === 'search'}
+      {#each draft.indexers as indexer, ix (indexer.id || ix)}
+        {@const test = tests[indexer.id || String(ix)]}
+        <div class="indexer">
+          <div class="indexer-head">
+            <span class="kind">{indexer.kind}</span>
+            <input
+              class="input name-input"
+              spellcheck="false"
+              aria-label="name"
+              value={indexer.name}
+              onchange={(e) => editIndexer(ix, (i) => (i.name = e.currentTarget.value.trim()))}
+            />
+            <Checkbox checked={indexer.enabled} label="on" onchange={(v) => editIndexer(ix, (i) => (i.enabled = v))} />
+            <button
+              type="button"
+              class="btn ghost icon"
+              aria-label="remove {indexer.name || indexer.kind}"
+              title="remove"
+              onclick={() => save((s) => s.indexers.splice(ix, 1))}
+            >
+              <Trash />
+            </button>
+          </div>
+          <input
+            class="input"
+            spellcheck="false"
+            aria-label="{indexer.kind} address"
+            placeholder={DEFAULT_URL[indexer.kind]}
+            value={indexer.url}
+            onchange={(e) => editIndexer(ix, (i) => (i.url = e.currentTarget.value.trim()))}
+          />
+          <div class="inline">
+            <input
+              class="input"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="{indexer.kind} API key"
+              placeholder={indexer.has_key ? 'key saved · type to replace' : 'api key'}
+              value={indexer.api_key}
+              onchange={(e) => {
+                const key = e.currentTarget.value.trim()
+                if (key) editIndexer(ix, (i) => (i.api_key = key))
+              }}
+            />
+            <button type="button" class="btn" disabled={test?.busy} onclick={() => testIndexer(ix)}>test</button>
+          </div>
+          {#if test}
+            <p class={['test', test.error && 'error']} role={test.error ? 'alert' : 'status'}>{test.text}</p>
+          {/if}
+        </div>
+      {/each}
+      <div class="inline adds">
+        <button type="button" class="btn" onclick={() => addIndexer('prowlarr')}><Plus />add prowlarr</button>
+        <button type="button" class="btn" onclick={() => addIndexer('jackett')}><Plus />add jackett</button>
+      </div>
+      <p class="hint">the API key is in prowlarr under settings → general, and at the top right of jackett's dashboard.</p>
+    {:else if app.settingsTab === 'web'}
       <div class="checks">
         <Checkbox checked={draft.web.enabled} label="web UI on" onchange={(v) => (v ? save((s) => (s.web.enabled = v)) : risky('turn off the web UI? this page stops working until it is turned on in the bawkbit app.', 'turn off', (s) => (s.web.enabled = false)))} />
       </div>
@@ -314,7 +404,7 @@
       <div class="checks">
         <Checkbox checked={draft.web.local_bypass} label="no password on this computer" onchange={(v) => save((s) => (s.web.local_bypass = v))} />
       </div>
-    {:else if tab === 'appearance'}
+    {:else if app.settingsTab === 'appearance'}
       <div class="row">
         <span>theme</span>
         <div class="seg">
@@ -358,6 +448,7 @@
     grid-template-columns: 180px minmax(0, 560px);
     gap: 40px;
     align-items: start;
+    align-content: start;
     height: 100%;
     padding: 28px 32px 64px;
     overflow-y: auto;
@@ -516,6 +607,45 @@
     border-color: var(--yolk);
     background: var(--yolk-dim);
     color: var(--text-strong);
+  }
+  .indexer {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    border: 1px solid var(--border-weak);
+    border-radius: var(--radius-lg);
+  }
+  .indexer-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .kind {
+    flex: none;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--bg-weak-hover);
+    color: var(--text-weak);
+    font-size: 12px;
+  }
+  .name-input {
+    flex: 1;
+    min-width: 0;
+  }
+  .indexer .inline .input {
+    flex: 1;
+    min-width: 0;
+  }
+  .test {
+    color: var(--success);
+    font-size: 12px;
+  }
+  .test.error {
+    color: var(--danger);
+  }
+  .adds {
+    margin-top: 4px;
   }
   @media (max-width: 720px) {
     .page {
