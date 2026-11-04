@@ -29,6 +29,8 @@
   let height = $state(Number(localStorage.getItem('bawkbit.details-height')) || 300)
   let pending = $state.raw<{ id: string; files: Set<number> } | null>(null)
   let saveTimer: ReturnType<typeof setTimeout> | null = null
+  let trackerText = $state('')
+  let trackerBusy = $state(false)
 
   const torrent = $derived(app.current)
   const shown = $derived(details && details.id === app.focused ? details : null)
@@ -93,6 +95,41 @@
       }
       if (pending?.files === next) pending = null
     }, 600)
+  }
+
+  async function refresh(id: string): Promise<void> {
+    try {
+      details = await api.details(id)
+    } catch {
+      // the next poll will catch up
+    }
+  }
+
+  async function addTrackers(event: SubmitEvent): Promise<void> {
+    event.preventDefault()
+    const id = shown?.id
+    if (!id || trackerBusy) return
+    trackerBusy = true
+    if (await app.addTrackers(id, trackerText)) {
+      trackerText = ''
+      await refresh(id)
+    }
+    trackerBusy = false
+  }
+
+  async function removeTracker(url: string): Promise<void> {
+    if (!shown || trackerBusy) return
+    const id = shown.id
+    trackerBusy = true
+    if (await app.removeTracker(id, url, shown.trackers)) await refresh(id)
+    trackerBusy = false
+  }
+
+  function trackerKeys(event: KeyboardEvent): void {
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault()
+      ;(event.currentTarget as HTMLTextAreaElement).form?.requestSubmit()
+    }
   }
 
   function startResize(event: PointerEvent): void {
@@ -163,10 +200,14 @@
             <PieceMap map={shown.piece_map} label="{percent(torrent.progress)} of the pieces are here" />
           {/if}
           <dl class="grid">
-            <div><dt>state</dt><dd style:color={looks[torrent.state].color}>{looks[torrent.state].label}</dd></div>
+            <div><dt>state</dt><dd style:color={looks[torrent.state].color}>{looks[torrent.state].label}{#if torrent.forced}<span class="muted"> · forced</span>{/if}</dd></div>
             <div><dt>progress</dt><dd class="num">{percent(torrent.progress)} <span class="muted">· {bytes(torrent.done)} of {bytes(torrent.size)}</span></dd></div>
             <div><dt>speed</dt><dd class="num"><span class="d">↓ {speed(torrent.down) || '0 B/s'}</span> <span class="u">↑ {speed(torrent.up) || '0 B/s'}</span></dd></div>
             <div><dt>time left</dt><dd class="num">{eta(torrent.eta) || '–'}</dd></div>
+            {#if torrent.down_limit || torrent.up_limit}
+              <div><dt>limits</dt><dd class="num"><span class="d">↓ {speed(torrent.down_limit) || 'none'}</span> <span class="u">↑ {speed(torrent.up_limit) || 'none'}</span></dd></div>
+            {/if}
+            {#if torrent.no_upload}<div><dt>upload</dt><dd>off</dd></div>{/if}
             <div><dt>uploaded</dt><dd class="num">{bytes(torrent.uploaded)} <span class="muted">· ratio {ratio(torrent.ratio)}</span></dd></div>
             <div><dt>peers</dt><dd class="num">{torrent.peers} <span class="muted">· {torrent.seeds} seeding</span></dd></div>
             <div><dt>added</dt><dd>{date(torrent.added)}</dd></div>
@@ -253,10 +294,23 @@
               <div class="tr">
                 <span class="truncate selectable">{url}</span>
                 <button type="button" class="btn ghost small icon" aria-label="copy tracker" title="copy" onclick={() => app.copy(url, 'tracker')}><Copy /></button>
+                <button type="button" class="btn ghost small icon" aria-label="remove tracker {url}" title="remove" disabled={trackerBusy} onclick={() => removeTracker(url)}><X /></button>
               </div>
             {/each}
           </div>
         {/if}
+        <form class="add-trackers" onsubmit={addTrackers}>
+          <textarea
+            class="input"
+            rows="2"
+            placeholder="add trackers, one per line"
+            aria-label="add trackers, one per line"
+            spellcheck="false"
+            bind:value={trackerText}
+            onkeydown={trackerKeys}
+          ></textarea>
+          <button type="submit" class="btn small" disabled={trackerBusy || !trackerText.trim()}>add</button>
+        </form>
       {/if}
     </div>
   </aside>
@@ -444,7 +498,18 @@
     grid-template-columns: minmax(150px, 1.1fr) minmax(0, 1.3fr) 84px 84px 76px 44px;
   }
   .trackers .tr {
-    grid-template-columns: minmax(0, 1fr) 24px;
+    grid-template-columns: minmax(0, 1fr) 24px 24px;
+    gap: 6px;
+  }
+  .add-trackers {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    padding: 12px 16px 16px;
+  }
+  .add-trackers textarea {
+    flex: 1;
+    min-height: 54px;
   }
 
   .sheet {

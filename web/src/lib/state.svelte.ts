@@ -40,6 +40,13 @@ export interface Prompt {
   run: (value: string) => void
 }
 
+/** Bytes per second, 0 for no limit. */
+export interface LimitsEdit {
+  ids: Id[]
+  down: number
+  up: number
+}
+
 export interface AddIntent {
   link?: string
   file?: File
@@ -115,6 +122,8 @@ class App {
   menu = $state<Menu | null>(null)
   confirm = $state<Confirm | null>(null)
   prompt = $state<Prompt | null>(null)
+  limits = $state<LimitsEdit | null>(null)
+  addingTrackers = $state<Id | null>(null)
   toasts = $state<Toast[]>([])
   dragging = $state(false)
 
@@ -379,6 +388,47 @@ class App {
     const chosen = this.torrents.filter((t) => ids.includes(t.id))
     if (chosen.some(isRunning)) this.pause(ids)
     else this.resume(ids)
+  }
+
+  forceStart(ids: Id[]): void {
+    if (ids.length) void this.act({ action: 'force_start', ids })
+  }
+
+  recheck(ids: Id[]): void {
+    if (ids.length) void this.act({ action: 'recheck', ids })
+  }
+
+  setNoUpload(ids: Id[], on: boolean): void {
+    if (ids.length) void this.act({ action: 'set_no_upload', ids, on })
+  }
+
+  /** Opens the limits dialog, filled in when every picked torrent has the same limits. */
+  editLimits(ids: Id[]): void {
+    const chosen = this.torrents.filter((t) => ids.includes(t.id))
+    if (!chosen.length) return
+    const same = chosen.every((t) => t.down_limit === chosen[0].down_limit && t.up_limit === chosen[0].up_limit)
+    this.limits = { ids, down: same ? chosen[0].down_limit : 0, up: same ? chosen[0].up_limit : 0 }
+  }
+
+  async setLimits(ids: Id[], down: number, up: number): Promise<boolean> {
+    return this.act({ action: 'set_limits', ids, down, up })
+  }
+
+  /** Adds addresses, one per line, to the trackers the torrent has now. */
+  async addTrackers(id: Id, text: string): Promise<boolean> {
+    const fresh = text.split(/\s+/).map((line) => line.trim()).filter(Boolean)
+    if (!fresh.length) return false
+    try {
+      const { trackers } = await api.details(id)
+      return await this.act({ action: 'set_trackers', id, trackers: [...trackers, ...fresh] })
+    } catch (error) {
+      this.toast((error as Error).message, true)
+      return false
+    }
+  }
+
+  async removeTracker(id: Id, url: string, trackers: string[]): Promise<boolean> {
+    return this.act({ action: 'set_trackers', id, trackers: trackers.filter((t) => t !== url) })
   }
 
   private async removeNow(ids: Id[], deleteFiles: boolean): Promise<void> {

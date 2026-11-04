@@ -6,12 +6,15 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::{Disableable, Icon, VirtualListScrollHandle, WindowExt, v_virtual_list};
+use gpui_kit::component::{
+    Disableable, Icon, Sizable, VirtualListScrollHandle, WindowExt, v_virtual_list,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::chrome::run_action;
 use super::filter::state_label;
-use super::{act, kit};
+use super::{act, kit, prompts};
 use crate::engine::Engine;
 use crate::format;
 use crate::theme::{Palette, palette};
@@ -515,30 +518,69 @@ impl DetailsView {
             .into_any_element()
     }
 
-    fn render_trackers(&self, p: &Palette) -> AnyElement {
-        let trackers = self
-            .details
-            .as_ref()
-            .map(|d| d.trackers.clone())
-            .unwrap_or_default();
-        if trackers.is_empty() {
+    fn render_trackers(&self, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let Some(details) = self.details.as_ref() else {
             return placeholder("no trackers: peers come from DHT", p);
-        }
+        };
+        let (engine, id, trackers) = (
+            self.engine.clone(),
+            details.id.clone(),
+            details.trackers.clone(),
+        );
+        let list: AnyElement = if trackers.is_empty() {
+            placeholder("no trackers: peers come from DHT", p)
+        } else {
+            div()
+                .id("trackers")
+                .size_full()
+                .overflow_y_scroll()
+                .py_2()
+                .text_size(px(12.))
+                .children(trackers.iter().enumerate().map(|(ix, url)| {
+                    let rest: Vec<String> =
+                        trackers.iter().filter(|t| *t != url).cloned().collect();
+                    let (engine, id) = (engine.clone(), id.clone());
+                    div()
+                        .h(px(26.))
+                        .pl_4()
+                        .pr_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_color(p.text)
+                        .child(kit::truncate(url.clone()).flex_1())
+                        .child(
+                            kit::button(("remove-tracker", ix), cx)
+                                .xsmall()
+                                .icon(Icon::new(IconName::X))
+                                .tooltip("remove")
+                                .on_click(move |_, window, cx| {
+                                    let action = Action::SetTrackers {
+                                        id: id.clone(),
+                                        trackers: rest.clone(),
+                                    };
+                                    run_action(&engine, action, window, cx);
+                                }),
+                        )
+                }))
+                .into_any_element()
+        };
         div()
-            .id("trackers")
             .size_full()
-            .overflow_y_scroll()
-            .py_2()
-            .text_size(px(12.))
-            .children(trackers.into_iter().map(|url| {
-                div()
-                    .h(px(26.))
-                    .px_4()
-                    .flex()
-                    .items_center()
-                    .text_color(p.text)
-                    .child(kit::truncate(url))
-            }))
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h_0().child(list))
+            .child(
+                div().px_4().py_2().flex().child(
+                    kit::button("add-trackers", cx)
+                        .small()
+                        .icon(Icon::new(IconName::ListPlus))
+                        .label("add trackers")
+                        .on_click(move |_, window, cx| {
+                            prompts::add_trackers(engine.clone(), id.clone(), window, cx)
+                        }),
+                ),
+            )
             .into_any_element()
     }
 }
@@ -566,7 +608,7 @@ impl Render for DetailsView {
             Tab::Overview => self.render_overview(torrent.as_ref(), &p, cx),
             Tab::Files => self.render_files(&p, cx),
             Tab::Peers => self.render_peers(&p),
-            Tab::Trackers => self.render_trackers(&p),
+            Tab::Trackers => self.render_trackers(&p, cx),
         };
         div()
             .size_full()

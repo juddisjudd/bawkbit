@@ -9,6 +9,7 @@ publish = false
 
 [workspace]
 members = ["crates/core", "crates/web", "crates/daemon"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.2.0"
@@ -64,6 +65,9 @@ rustybuzz = { opt-level = 3 }
 taffy = { opt-level = 3 }
 ttf-parser = { opt-level = 3 }
 ring = { opt-level = 3 }
+
+[patch.crates-io]
+librqbit = { path = "vendor/librqbit" }
 
 [profile.release]
 lto = "thin"

@@ -4,6 +4,7 @@ mod details;
 mod filter;
 mod kit;
 mod list;
+mod prompts;
 mod search;
 mod settings;
 mod updates;

@@ -13,6 +13,7 @@ RUN apt-get update \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+COPY vendor vendor
 COPY --from=web /src/web/dist web/dist
 RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo build --release --locked -p bawkbitd

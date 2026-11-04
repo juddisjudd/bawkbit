@@ -103,7 +103,8 @@ Double-click a torrent to open its folder. Right-click it for everything else.
 - **A queue**: only so many downloads run at once, the rest wait their turn.
 - **Seeding goals**: stop at a ratio or after a time.
 - **A watch folder**: `.torrent` files put there are added on their own.
-- **Details** for each torrent: a piece map, files with per-file progress and selection, peers and trackers.
+- **Details** for each torrent: a piece map, files with per-file progress and selection, peers, and trackers you can add and remove.
+- **Per torrent**, from the right-click menu: force start past the queue, re-check, no upload, its own speed limits, and more trackers. A torrent keeps what it has downloaded when you add trackers.
 - **DHT**, UPnP port forwarding and peer exchange through the engine.
 - **One instance**: opening a magnet link while bawkbit runs hands it to the open window.
 - **Updates itself** from the releases page, after checking each download's checksum.
@@ -159,6 +160,7 @@ $env:LOG_LEVEL = "DEBUG"; $env:LOG_FILE = "$env:TEMP\bawkbit.log"; cargo run
 | [`crates/daemon`](crates/daemon) | `bawkbitd`, the engine and the web UI without a window. |
 | [`src`](src) | The desktop app, drawn with GPUI. |
 | [`web`](web) | The web UI, in Svelte. See [web/README.md](web/README.md). |
+| [`vendor`](vendor) | librqbit with a small patch for per-torrent upload and speed limits. See [vendor/README.md](vendor/README.md). |
 
 ### Builds and releases
 
@@ -187,14 +189,14 @@ The web UI uses this API, and so can your scripts. Log in with `POST /api/login`
 | `POST /api/torrents` | adds a torrent |
 | `POST /api/search` | searches every turned-on Prowlarr and Jackett |
 | `POST /api/indexers/test` | checks a Prowlarr or Jackett address and key |
-| `POST /api/actions` | pause, resume, remove, set files, categories, tags and the alternative limits |
+| `POST /api/actions` | pause, resume, force start, re-check, remove, set files, trackers, no upload, speed limits, categories, tags and the alternative limits |
 | `GET` or `PUT /api/settings` | reads or changes the engine settings |
 
 The request and answer shapes are in [`crates/core/src/api.rs`](crates/core/src/api.rs). A torrent's `id` is its info hash.
 
 ## Credits
 
-- [librqbit](https://github.com/ikatson/rqbit) (Apache-2.0) is the BitTorrent engine.
+- [librqbit](https://github.com/ikatson/rqbit) (Apache-2.0) is the BitTorrent engine, with the small patch in [`vendor`](vendor).
 - [GPUI Kit](https://github.com/longbridge/gpui-kit) (Apache-2.0) and Zed's GPUI draw the desktop app.
 - [axum](https://github.com/tokio-rs/axum) (MIT) serves the web UI. [Svelte](https://svelte.dev) (MIT) builds it.
 - [IBM Plex Mono](https://github.com/IBM/plex) (SIL Open Font License, `assets/fonts/OFL.txt`) is the typeface.

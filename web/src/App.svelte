@@ -4,6 +4,7 @@
   import ContextMenu from '$lib/components/ContextMenu.svelte'
   import Details from '$lib/components/Details.svelte'
   import Header from '$lib/components/Header.svelte'
+  import LimitsDialog from '$lib/components/LimitsDialog.svelte'
   import Login from '$lib/components/Login.svelte'
   import PromptDialog from '$lib/components/PromptDialog.svelte'
   import SearchPage from '$lib/components/SearchPage.svelte'
@@ -11,6 +12,7 @@
   import Sidebar from '$lib/components/Sidebar.svelte'
   import Toasts from '$lib/components/Toasts.svelte'
   import TorrentList from '$lib/components/TorrentList.svelte'
+  import TrackersDialog from '$lib/components/TrackersDialog.svelte'
   import Logo from '$lib/components/Logo.svelte'
   import { app } from '$lib/state.svelte'
 
@@ -138,6 +140,8 @@
   {#if app.adding}<AddDialog intent={app.adding} />{/if}
   {#if app.confirm}<ConfirmDialog confirm={app.confirm} />{/if}
   {#if app.prompt}<PromptDialog prompt={app.prompt} />{/if}
+  {#if app.limits}<LimitsDialog edit={app.limits} />{/if}
+  {#if app.addingTrackers}<TrackersDialog id={app.addingTrackers} />{/if}
   <ContextMenu />
 {/if}
 <Toasts />

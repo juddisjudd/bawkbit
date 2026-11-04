@@ -266,6 +266,14 @@ button {
   cursor: pointer;
 }
 
+textarea.input {
+  height: auto;
+  min-height: 64px;
+  padding: 8px 10px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
 .input::placeholder {
   color: var(--text-weaker);
 }

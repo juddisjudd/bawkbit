@@ -10,13 +10,15 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{Icon, Sizable, VirtualListScrollHandle, WindowExt, v_virtual_list};
+use gpui_kit::component::{
+    Icon, Side, Sizable, VirtualListScrollHandle, WindowExt, v_virtual_list,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::chrome::run_action;
 use super::filter::{Filters, Status, state_icon, state_label};
-use super::{act, kit};
+use super::{act, kit, prompts};
 use crate::config::{Column, Config};
 use crate::engine::Engine;
 use crate::format;
@@ -558,6 +560,10 @@ fn row_menu(
     }
     let any_paused = picked.iter().any(|t| t.state.is_paused());
     let any_running = picked.iter().any(|t| !t.state.is_paused());
+    let all_forced = picked.iter().all(|t| t.forced);
+    let all_quiet = picked.iter().all(|t| t.no_upload);
+    let limits: HashSet<(u64, u64)> = picked.iter().map(|t| (t.down_limit, t.up_limit)).collect();
+    let shared_limits = (limits.len() == 1).then(|| limits.into_iter().next().unwrap_or_default());
     let single = (picked.len() == 1).then(|| picked[0].clone());
 
     let item = |label: &'static str, icon: IconName, action: Action| {
@@ -567,7 +573,7 @@ fn row_menu(
             .on_click(move |_, window, cx| run_action(&engine, action.clone(), window, cx))
     };
 
-    let mut menu = menu.min_w(px(200.));
+    let mut menu = menu.min_w(px(200.)).check_side(Side::Right);
     if any_paused {
         menu = menu.item(item(
             "resume",
@@ -582,7 +588,19 @@ fn row_menu(
             Action::Pause { ids: ids.clone() },
         ));
     }
-    menu = menu.separator();
+    let start = if all_forced {
+        Action::Resume { ids: ids.clone() }
+    } else {
+        Action::ForceStart { ids: ids.clone() }
+    };
+    menu = menu
+        .item(item("force start", IconName::FastForward, start).checked(all_forced))
+        .item(item(
+            "re-check",
+            IconName::RefreshCw,
+            Action::Recheck { ids: ids.clone() },
+        ))
+        .separator();
 
     let current_category = single.as_ref().and_then(|t| t.category.clone());
     let categories = snapshot.categories.clone();
@@ -683,30 +701,71 @@ fn row_menu(
         },
     );
 
-    if let Some(torrent) = single {
-        let path = torrent.save_path.clone();
-        let id = torrent.id.clone();
-        let core = engine.read(cx).core().clone();
-        menu = menu
-            .separator()
-            .item(
-                PopupMenuItem::new("open folder")
-                    .icon(Icon::new(IconName::FolderOpen))
-                    .on_click(move |_, _, cx| open_folder(&path, cx)),
-            )
-            .item(
-                PopupMenuItem::new("copy magnet link")
-                    .icon(Icon::new(IconName::Magnet))
-                    .on_click(move |_, window, cx| {
-                        let magnet = core
-                            .details(&id)
-                            .map(|details| details.magnet)
-                            .unwrap_or_else(|_| format!("magnet:?xt=urn:btih:{id}"));
-                        cx.write_to_clipboard(ClipboardItem::new_string(magnet));
-                        window.push_notification("magnet link copied", cx);
-                    }),
-            );
+    let quiet = Action::SetNoUpload {
+        ids: ids.clone(),
+        on: !all_quiet,
+    };
+    let (limit_engine, limit_ids) = (engine.clone(), ids.clone());
+    menu = menu
+        .item(item("no upload", IconName::Ban, quiet).checked(all_quiet))
+        .item(
+            PopupMenuItem::new("speed limits")
+                .icon(Icon::new(IconName::Gauge))
+                .on_click(move |_, window, cx| {
+                    let (engine, ids) = (limit_engine.clone(), limit_ids.clone());
+                    prompts::speed_limits(engine, ids, shared_limits, window, cx)
+                }),
+        );
+    if let Some(torrent) = &single {
+        let (engine, id) = (engine.clone(), torrent.id.clone());
+        menu = menu.item(
+            PopupMenuItem::new("add trackers")
+                .icon(Icon::new(IconName::ListPlus))
+                .on_click(move |_, window, cx| {
+                    prompts::add_trackers(engine.clone(), id.clone(), window, cx)
+                }),
+        );
     }
+
+    menu = menu.separator();
+    if let Some(torrent) = &single {
+        let path = torrent.save_path.clone();
+        menu = menu.item(
+            PopupMenuItem::new("open folder")
+                .icon(Icon::new(IconName::FolderOpen))
+                .on_click(move |_, _, cx| open_folder(&path, cx)),
+        );
+    }
+    let core = engine.read(cx).core().clone();
+    menu = menu.submenu_with_icon(
+        Some(Icon::new(IconName::Copy)),
+        "copy",
+        window,
+        cx,
+        move |menu, _, _| {
+            let joined = |text: &dyn Fn(&Torrent) -> String| {
+                picked.iter().map(text).collect::<Vec<_>>().join("\n")
+            };
+            let magnets = joined(&|t| {
+                core.details(&t.id)
+                    .map(|details| details.magnet)
+                    .unwrap_or_else(|_| format!("magnet:?xt=urn:btih:{}", t.id))
+            });
+            let copy = |label: &'static str, text: String, note: &'static str| {
+                PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                    window.push_notification(note, cx);
+                })
+            };
+            menu.item(copy("magnet link", magnets, "magnet link copied"))
+                .item(copy(
+                    "info hash",
+                    joined(&|t| t.id.clone()),
+                    "info hash copied",
+                ))
+                .item(copy("name", joined(&|t| t.name.clone()), "name copied"))
+        },
+    );
 
     let delete_ids = ids.clone();
     let delete_engine = engine.clone();

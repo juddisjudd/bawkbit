@@ -213,6 +213,10 @@ mod tests {
             completed: None,
             save_path: String::new(),
             error: None,
+            forced: false,
+            no_upload: false,
+            down_limit: 0,
+            up_limit: 0,
         }
     }
 

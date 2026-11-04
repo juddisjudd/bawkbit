@@ -53,6 +53,15 @@ pub struct Torrent {
     pub completed: Option<i64>,
     pub save_path: String,
     pub error: Option<String>,
+    #[serde(default)]
+    pub forced: bool,
+    #[serde(default)]
+    pub no_upload: bool,
+    /// Bytes per second for this torrent alone; 0 means no limit.
+    #[serde(default)]
+    pub down_limit: u64,
+    #[serde(default)]
+    pub up_limit: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -227,6 +236,29 @@ pub enum Action {
     },
     PauseAll,
     ResumeAll,
+    /// Starts torrents even when the download queue is full.
+    ForceStart {
+        ids: Vec<Id>,
+    },
+    /// Checks every piece on disk again.
+    Recheck {
+        ids: Vec<Id>,
+    },
+    /// Replaces a torrent's trackers; it keeps its pieces and carries on.
+    SetTrackers {
+        id: Id,
+        trackers: Vec<String>,
+    },
+    SetNoUpload {
+        ids: Vec<Id>,
+        on: bool,
+    },
+    /// Bytes per second; 0 means no limit.
+    SetLimits {
+        ids: Vec<Id>,
+        down: u64,
+        up: u64,
+    },
 }
 
 /// The answer to any request that changes something.

@@ -47,6 +47,26 @@ function tagItems(ids: Id[]): (MenuItem | 'sep')[] {
   ]
 }
 
+function copyItems(ids: Id[]): MenuItem[] {
+  const chosen = app.torrents.filter((t) => ids.includes(t.id))
+  const many = chosen.length > 1
+  return [
+    {
+      label: many ? 'magnet links' : 'magnet link',
+      action: async () => {
+        try {
+          const links = await Promise.all(chosen.map(async (t) => (await api.details(t.id)).magnet))
+          await app.copy(links.join('\n'), many ? 'magnet links' : 'magnet link')
+        } catch (error) {
+          app.toast((error as Error).message, true)
+        }
+      }
+    },
+    { label: many ? 'info hashes' : 'info hash', action: () => app.copy(chosen.map((t) => t.id).join('\n'), many ? 'info hashes' : 'info hash') },
+    { label: many ? 'names' : 'name', action: () => app.copy(chosen.map((t) => t.name).join('\n'), many ? 'names' : 'name') }
+  ]
+}
+
 /** The right-click menu for the selected torrents. */
 export function openTorrentMenu(x: number, y: number): void {
   const ids = app.targets()
@@ -54,6 +74,8 @@ export function openTorrentMenu(x: number, y: number): void {
   const chosen = app.torrents.filter((t) => ids.includes(t.id))
   const running = chosen.some(isRunning)
   const stopped = chosen.some((t) => !isRunning(t))
+  const forced = chosen.length > 0 && chosen.every((t) => t.forced)
+  const quiet = chosen.length > 0 && chosen.every((t) => t.no_upload)
   const one = ids.length === 1 ? ids[0] : null
   app.menu = {
     x,
@@ -61,27 +83,19 @@ export function openTorrentMenu(x: number, y: number): void {
     items: [
       { label: 'resume', disabled: !stopped, action: () => app.resume(ids) },
       { label: 'pause', disabled: !running, action: () => app.pause(ids) },
+      { label: 'force start', checked: forced, action: () => (forced ? app.resume(ids) : app.forceStart(ids)) },
+      { label: 're-check', action: () => app.recheck(ids) },
       'sep',
       { label: 'category', items: () => categoryItems(ids) },
       { label: 'tags', items: () => tagItems(ids) },
       'sep',
-      ...(one
-        ? [
-            { label: 'details', action: () => app.openDetails(one) },
-            {
-              label: 'copy magnet link',
-              action: async () => {
-                try {
-                  const details = await api.details(one)
-                  await app.copy(details.magnet, 'magnet link')
-                } catch (error) {
-                  app.toast((error as Error).message, true)
-                }
-              }
-            },
-            'sep' as const
-          ]
-        : []),
+      { label: 'no upload', checked: quiet, action: () => app.setNoUpload(ids, !quiet) },
+      { label: 'speed limits…', action: () => app.editLimits(ids) },
+      ...(one ? [{ label: 'add trackers…', action: () => (app.addingTrackers = one) }] : []),
+      'sep',
+      ...(one ? [{ label: 'details', action: () => app.openDetails(one) }] : []),
+      { label: 'copy', items: () => copyItems(ids) },
+      'sep',
       { label: 'remove', action: () => app.remove(ids, false) },
       { label: 'remove and delete files', danger: true, action: () => app.remove(ids, true) }
     ]

@@ -30,6 +30,13 @@ pub struct Entry {
     pub done: bool,
     /// Resumed by hand after reaching the seeding goal, so the goal no longer applies.
     pub keep_seeding: bool,
+    /// Runs whatever the download queue says.
+    pub forced: bool,
+    /// Never tells peers it has pieces, so nothing is uploaded.
+    pub no_upload: bool,
+    /// Bytes per second for this torrent alone; 0 means no limit.
+    pub down_limit: u64,
+    pub up_limit: u64,
 }
 
 impl Store {

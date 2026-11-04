@@ -111,6 +111,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 enum Op {
     Pause(Handle),
     Resume(Handle),
+    /// Drops every peer so the next ones hear whether this torrent uploads.
+    Reconnect(Handle),
 }
 
 impl Core {
@@ -274,26 +276,43 @@ impl Core {
                     if let Ok(handle) = self.handle(&id) {
                         self.session().pause(&handle).await.ok();
                     }
-                    self.edit_store(|store| store.entry(&id).queued = false);
-                }
-            }
-            Action::Resume { ids } => {
-                for id in ids {
-                    let Ok(handle) = self.handle(&id) else {
-                        continue;
-                    };
-                    let finished = handle.stats().finished;
                     self.edit_store(|store| {
                         let entry = store.entry(&id);
                         entry.queued = false;
-                        if entry.done || finished {
-                            entry.keep_seeding = entry.done || entry.keep_seeding;
-                            entry.done = false;
-                        }
+                        entry.forced = false;
                     });
-                    self.session().unpause(&handle).await.ok();
                 }
             }
+            Action::Resume { ids } => self.resume(ids, false).await,
+            Action::ForceStart { ids } => self.resume(ids, true).await,
+            Action::Recheck { ids } => {
+                for id in ids {
+                    let trackers = self
+                        .handle(&id)?
+                        .shared()
+                        .trackers
+                        .iter()
+                        .map(|url| url.to_string())
+                        .collect();
+                    self.reload(&id, trackers, false).await?;
+                }
+            }
+            Action::SetTrackers { id, trackers } => {
+                let trackers = clean_trackers(trackers)?;
+                self.reload(&id, trackers, true).await?;
+            }
+            Action::SetNoUpload { ids, on } => self.edit_store(|store| {
+                for id in ids {
+                    store.entry(&id).no_upload = on;
+                }
+            }),
+            Action::SetLimits { ids, down, up } => self.edit_store(|store| {
+                for id in ids {
+                    let entry = store.entry(&id);
+                    entry.down_limit = down;
+                    entry.up_limit = up;
+                }
+            }),
             Action::Remove { ids, delete_files } => {
                 for id in ids {
                     lock(&self.inner.pending).retain(|pending| pending.id != id);
@@ -401,6 +420,92 @@ impl Core {
         }
         self.tick().await;
         Ok(Reply::Done)
+    }
+
+    async fn resume(&self, ids: Vec<Id>, forced: bool) {
+        for id in ids {
+            let Ok(handle) = self.handle(&id) else {
+                continue;
+            };
+            let finished = handle.stats().finished;
+            self.edit_store(|store| {
+                let entry = store.entry(&id);
+                entry.queued = false;
+                entry.forced = forced;
+                if entry.done || finished {
+                    entry.keep_seeding = entry.done || entry.keep_seeding;
+                    entry.done = false;
+                }
+            });
+            self.session().unpause(&handle).await.ok();
+        }
+    }
+
+    /// Takes a torrent out of the engine and adds it back with `trackers`, the only way the engine changes them; `keep_pieces` puts its saved piece map back, so only a spot check runs.
+    async fn reload(&self, id: &str, trackers: Vec<String>, keep_pieces: bool) -> Result<()> {
+        let _guard = self.inner.rebuilding.lock().await;
+        let session = self.session();
+        let handle = self.handle(id)?;
+        let metadata = handle
+            .metadata
+            .load_full()
+            .ok_or_else(|| anyhow!("wait until it has found its files"))?;
+        let hash = handle.info_hash();
+        let paused = handle.is_paused();
+        let before: Vec<String> = handle
+            .shared()
+            .trackers
+            .iter()
+            .map(|url| url.to_string())
+            .collect();
+        let output = handle.output_folder().to_string_lossy().into_owned();
+        let only_files = handle.only_files();
+        let options = || AddTorrentOptions {
+            paused,
+            output_folder: Some(output.clone()),
+            only_files: only_files.clone(),
+            overwrite: true,
+            ..Default::default()
+        };
+        if !paused {
+            session.pause(&handle).await.ok();
+        }
+        drop(handle);
+
+        let pieces = self.inner.paths.session.join(format!("{hash:?}.bitv"));
+        let kept = pieces.with_extension("bitv.kept");
+        if keep_pieces {
+            tokio::fs::copy(&pieces, &kept).await.ok();
+        }
+        session.delete(TorrentIdOrHash::Hash(hash), false).await?;
+        if keep_pieces {
+            tokio::fs::rename(&kept, &pieces).await.ok();
+        } else if let Err(err) = tokio::fs::remove_file(&pieces).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("cannot clear the saved pieces of {id}: {err}");
+        }
+
+        let add = |trackers: &[String]| {
+            let bytes = Bytes::from(torrent_file(&metadata.info_bytes, trackers));
+            session.add_torrent(AddTorrent::from_bytes(bytes), Some(options()))
+        };
+        let added = match add(&trackers).await {
+            Ok(added) => added,
+            Err(err) => {
+                add(&before).await.map_err(|err| anyhow!("{err:#}"))?;
+                bail!("{err:#}");
+            }
+        };
+        if let Some(handle) = added.into_handle() {
+            let entry = lock(&self.inner.store)
+                .torrents
+                .get(id)
+                .cloned()
+                .unwrap_or_default();
+            apply_entry(&handle, &entry);
+        }
+        Ok(())
     }
 
     /// Fetches a torrent's file list without adding it, for the add dialog.
@@ -643,10 +748,11 @@ impl Core {
                 .torrents
                 .iter()
                 .filter(|t| {
-                    matches!(
-                        t.state,
-                        State::Downloading | State::Stalled | State::Checking
-                    )
+                    !t.forced
+                        && matches!(
+                            t.state,
+                            State::Downloading | State::Stalled | State::Checking
+                        )
                 })
                 .count()
                 >= max
@@ -789,6 +895,9 @@ impl Core {
 
     /// Reads every torrent, applies the queue, seeding goals and schedule, and publishes a snapshot.
     async fn tick(&self) {
+        if self.inner.rebuilding.try_lock().is_err() {
+            return;
+        }
         let handles = self.handles();
         let settings = self.settings();
         let (mut torrents, ops) = self.read_torrents(&handles, &settings);
@@ -797,6 +906,10 @@ impl Core {
             let result = match op {
                 Op::Pause(handle) => session.pause(&handle).await,
                 Op::Resume(handle) => session.unpause(&handle).await,
+                Op::Reconnect(handle) => match session.pause(&handle).await {
+                    Ok(()) => session.unpause(&handle).await,
+                    Err(err) => Err(err),
+                },
             };
             if let Err(err) = result {
                 tracing::debug!("queue change failed: {err:#}");
@@ -864,6 +977,9 @@ impl Core {
                 dirty = true;
             }
             let entry = store.entry(&id);
+            if apply_entry(handle, entry) && handle.live().is_some() {
+                ops.push(Op::Reconnect(handle.clone()));
+            }
 
             let last = live
                 .last_uploaded
@@ -923,10 +1039,12 @@ impl Core {
                 dirty = true;
                 ops.push(Op::Pause(handle.clone()));
             }
-            if matches!(
-                state,
-                State::Downloading | State::Stalled | State::Queued | State::Checking
-            ) {
+            if !entry.forced
+                && matches!(
+                    state,
+                    State::Downloading | State::Stalled | State::Queued | State::Checking
+                )
+            {
                 queue.push((entry.added, rows.len()));
             }
 
@@ -953,6 +1071,10 @@ impl Core {
                 completed: entry.completed,
                 save_path: handle.output_folder().to_string_lossy().into_owned(),
                 error: stats.error.clone(),
+                forced: entry.forced,
+                no_upload: entry.no_upload,
+                down_limit: entry.down_limit,
+                up_limit: entry.up_limit,
                 id,
             });
         }
@@ -1243,7 +1365,64 @@ fn pending_row(pending: &Pending) -> Torrent {
         completed: None,
         save_path: pending.save_path.clone(),
         error: pending.error.clone(),
+        forced: false,
+        no_upload: false,
+        down_limit: 0,
+        up_limit: 0,
     }
+}
+
+/// Puts bawkbit's choices for one torrent into the engine; true when its upload switch changed.
+fn apply_entry(handle: &Handle, entry: &Entry) -> bool {
+    let limits = handle.ratelimits();
+    if limits.get_download_bps() != bps(entry.down_limit) {
+        limits.set_download_bps(bps(entry.down_limit));
+    }
+    if limits.get_upload_bps() != bps(entry.up_limit) {
+        limits.set_upload_bps(bps(entry.up_limit));
+    }
+    handle.set_upload_disabled(entry.no_upload)
+}
+
+/// Trimmed, without repeats, each an http, https or udp address.
+fn clean_trackers(trackers: Vec<String>) -> Result<Vec<String>> {
+    let mut clean: Vec<String> = Vec::new();
+    for tracker in trackers.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        let url = reqwest::Url::parse(tracker)
+            .ok()
+            .filter(|url| matches!(url.scheme(), "http" | "https" | "udp") && url.has_host())
+            .ok_or_else(|| anyhow!("{tracker} is not a tracker address"))?
+            .to_string();
+        if !clean.contains(&url) {
+            clean.push(url);
+        }
+    }
+    Ok(clean)
+}
+
+/// A .torrent of `info` as it is with `trackers` as its announce list, which the engine saves and restores.
+fn torrent_file(info: &[u8], trackers: &[String]) -> Vec<u8> {
+    fn text(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(format!("{}:", value.len()).as_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    let mut out = b"d".to_vec();
+    if let Some(first) = trackers.first() {
+        text(&mut out, "announce");
+        text(&mut out, first);
+        text(&mut out, "announce-list");
+        out.push(b'l');
+        for tracker in trackers {
+            out.push(b'l');
+            text(&mut out, tracker);
+            out.push(b'e');
+        }
+        out.push(b'e');
+    }
+    text(&mut out, "info");
+    out.extend_from_slice(info);
+    out.push(b'e');
+    out
 }
 
 /// Buckets of pieces, each 0 to 255 for how many of its pieces are here.
@@ -1322,6 +1501,156 @@ fn free_space(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torrent_files_carry_the_trackers_and_keep_the_info_hash() {
+        let info = b"d6:lengthi3e4:name1:a12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        let trackers = vec![
+            "udp://one.example:1337/announce".to_string(),
+            "http://two.example/announce".to_string(),
+        ];
+        let with = torrent_file(info, &trackers);
+        let with = librqbit::torrent_from_bytes(&with).unwrap();
+        let announced: Vec<String> = with
+            .iter_announce()
+            .map(|t| String::from_utf8_lossy(t.as_ref()).into_owned())
+            .collect();
+        assert_eq!(announced, trackers);
+        let bare = torrent_file(info, &[]);
+        let bare = librqbit::torrent_from_bytes(&bare).unwrap();
+        assert_eq!(bare.info_hash, with.info_hash);
+        assert_eq!(bare.iter_announce().count(), 0);
+    }
+
+    #[test]
+    fn trackers_are_checked_and_deduplicated() {
+        let clean = clean_trackers(vec![
+            " udp://one.example:1337/announce ".into(),
+            String::new(),
+            "udp://one.example:1337/announce".into(),
+            "https://two.example/announce".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            clean,
+            [
+                "udp://one.example:1337/announce",
+                "https://two.example/announce"
+            ]
+        );
+        assert!(clean_trackers(vec!["not a tracker".into()]).is_err());
+        assert!(clean_trackers(vec!["ftp://three.example/".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_limit_below_one_request_still_lets_requests_through() {
+        let limits = librqbit::limits::Limits::new(LimitsConfig {
+            download_bps: bps(5000),
+            upload_bps: bps(5000),
+        });
+        let request = NonZeroU32::new(16 * 1024).unwrap();
+        let wait = Duration::from_secs(1);
+        let up = tokio::time::timeout(wait, limits.prepare_for_upload(request)).await;
+        assert!(matches!(up, Ok(Ok(()))));
+        let down = tokio::time::timeout(wait, limits.prepare_for_download(request)).await;
+        assert!(matches!(down, Ok(Ok(()))));
+    }
+
+    async fn wait_for(core: &Core, what: &str, check: impl Fn(&Torrent) -> bool) {
+        for _ in 0..300 {
+            if core.snapshot().torrents.first().is_some_and(&check) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("no {what}: {:?}", core.snapshot().torrents.first());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seeding_torrent_changes_trackers_rechecks_and_keeps_its_choices_after_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let downloads = root.path().join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let data: Vec<u8> = (0..3 * 65536u32).map(|n| (n * 7 % 251) as u8).collect();
+        std::fs::write(downloads.join("data.bin"), &data).unwrap();
+        let options = librqbit::CreateTorrentOptions {
+            name: None,
+            trackers: Vec::new(),
+            piece_length: Some(65536),
+        };
+        let spawner = librqbit::spawn_utils::BlockingSpawner::new(1);
+        let created = librqbit::create_torrent(&downloads.join("data.bin"), options, &spawner)
+            .await
+            .unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let settings = Settings {
+            download_dir: downloads.to_string_lossy().into_owned(),
+            dht: false,
+            upnp: false,
+            ..Settings::default()
+        };
+        settings.save(&home.join("settings.json")).unwrap();
+
+        let core = Core::start(home.clone()).await.unwrap();
+        let bytes = created.as_bytes().unwrap().to_vec();
+        let preview = core.preview(Source::File(bytes)).await.unwrap();
+        let mut request = AddRequest::link("");
+        request.source = Source::Resolved(preview.id.clone());
+        request.save_path = Some(settings.download_dir.clone());
+        let id = core.add(request).await.unwrap();
+        let seeding = |t: &Torrent| t.state == State::Seeding;
+        wait_for(&core, "seeding after the first check", seeding).await;
+
+        let trackers = vec![
+            "udp://one.example:1337/announce".to_string(),
+            "http://two.example/announce".to_string(),
+        ];
+        let mut sorted = trackers.clone();
+        sorted.sort();
+        let change = Action::SetTrackers {
+            id: id.clone(),
+            trackers: trackers.clone(),
+        };
+        core.execute(change).await.unwrap();
+        let pieces = home.join("session").join(format!("{id}.bitv"));
+        assert!(pieces.exists(), "the saved pieces should come back");
+        wait_for(&core, "seeding after the tracker change", seeding).await;
+        assert_eq!(core.details(&id).unwrap().trackers, sorted);
+
+        let ids = vec![id.clone()];
+        let quiet = Action::SetNoUpload {
+            ids: ids.clone(),
+            on: true,
+        };
+        core.execute(quiet).await.unwrap();
+        let limits = Action::SetLimits {
+            ids: ids.clone(),
+            down: 5000,
+            up: 7000,
+        };
+        core.execute(limits).await.unwrap();
+        let handle = core.handle(&id).unwrap();
+        assert!(handle.upload_disabled());
+        assert_eq!(handle.ratelimits().get_upload_bps().unwrap().get(), 7000);
+
+        core.execute(Action::Recheck { ids }).await.unwrap();
+        assert!(core.handle(&id).unwrap().upload_disabled());
+        wait_for(&core, "seeding after the recheck", seeding).await;
+
+        core.shutdown().await;
+        drop(core);
+        let core = Core::start(home).await.unwrap();
+        wait_for(&core, "seeding after a restart", seeding).await;
+        assert_eq!(core.details(&id).unwrap().trackers, sorted);
+        let handle = core.handle(&id).unwrap();
+        assert!(handle.upload_disabled());
+        assert_eq!(handle.ratelimits().get_download_bps().unwrap().get(), 5000);
+        let row = core.snapshot().torrents[0].clone();
+        assert!(row.no_upload);
+        assert_eq!((row.down_limit, row.up_limit), (5000, 7000));
+        core.shutdown().await;
+    }
 
     #[test]
     fn piece_map_scales_to_buckets() {

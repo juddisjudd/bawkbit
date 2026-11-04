@@ -33,6 +33,11 @@ export interface Torrent {
   completed: number | null
   save_path: string
   error: string | null
+  forced: boolean
+  no_upload: boolean
+  /** Bytes per second for this torrent alone; 0 means no limit. */
+  down_limit: number
+  up_limit: number
 }
 
 export interface Totals {
@@ -137,6 +142,11 @@ export type Action =
   | { action: 'set_alt_speed'; on: boolean }
   | { action: 'pause_all' }
   | { action: 'resume_all' }
+  | { action: 'force_start'; ids: Id[] }
+  | { action: 'recheck'; ids: Id[] }
+  | { action: 'set_trackers'; id: Id; trackers: string[] }
+  | { action: 'set_no_upload'; ids: Id[]; on: boolean }
+  | { action: 'set_limits'; ids: Id[]; down: number; up: number }
 
 export type Reply =
   | { kind: 'done' }

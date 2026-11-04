@@ -1,0 +1,152 @@
+diff -ru a/src/limits.rs b/src/limits.rs
+--- a/src/limits.rs	2006-07-23 18:21:28.000000000 -0700
++++ b/src/limits.rs	2026-11-03 16:36:12.275595200 -0800
+@@ -12,6 +12,9 @@
+     pub download_bps: Option<NonZeroU32>,
+ }
+ 
++/// Room for the largest single request; a smaller burst fails every request and drops the peer.
++const MIN_BURST: NonZeroU32 = NonZeroU32::new(128 * 1024).unwrap();
++
+ struct Limit {
+     limiter: ArcSwapOption<RateLimiter>,
+     current_bps: std::sync::atomic::AtomicU32,
+@@ -20,7 +23,8 @@
+ impl Limit {
+     fn new_inner(bps: Option<NonZeroU32>) -> Option<Arc<RateLimiter>> {
+         let bps = bps?;
+-        Some(Arc::new(RateLimiter::direct(Quota::per_second(bps))))
++        let quota = Quota::per_second(bps).allow_burst(bps.max(MIN_BURST));
++        Some(Arc::new(RateLimiter::direct(quota)))
+     }
+ 
+     fn new(bps: Option<NonZeroU32>) -> Self {
+diff -ru a/src/session.rs b/src/session.rs
+--- a/src/session.rs	2006-07-23 18:21:28.000000000 -0700
++++ b/src/session.rs	2026-11-03 16:31:19.089626400 -0800
+@@ -6,7 +6,7 @@
+     path::{Component, Path, PathBuf},
+     sync::{
+         Arc,
+-        atomic::{AtomicUsize, Ordering},
++        atomic::{AtomicBool, AtomicUsize, Ordering},
+     },
+     time::Duration,
+ };
+@@ -1366,12 +1366,14 @@
+                     peer_max_request_window: peer_opts.max_request_window,
+                     allow_overwrite: opts.overwrite,
+                     output_folder,
+-                    ratelimits: opts.ratelimits,
+                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
+                     peer_limit: opts.peer_limit.or(self.peer_limit),
+                     #[cfg(feature = "disable-upload")]
+-                    _disable_upload: self._disable_upload,
++                    disable_upload: AtomicBool::new(self._disable_upload),
++                    #[cfg(not(feature = "disable-upload"))]
++                    disable_upload: AtomicBool::new(false),
+                 },
++                ratelimits: Arc::new(Limits::new(opts.ratelimits)),
+                 connector: self.connector.clone(),
+                 session: Arc::downgrade(self),
+                 magnet_name: name,
+diff -ru a/src/torrent_state/live/mod.rs b/src/torrent_state/live/mod.rs
+--- a/src/torrent_state/live/mod.rs	2006-07-23 18:21:28.000000000 -0700
++++ b/src/torrent_state/live/mod.rs	2026-11-03 16:30:43.177150600 -0800
+@@ -213,7 +213,7 @@
+         tokio::sync::mpsc::UnboundedSender<WriterRequest>,
+         ChunkInfo,
+     )>,
+-    ratelimits: Limits,
++    ratelimits: Arc<Limits>,
+ }
+ 
+ impl TorrentStateLive {
+@@ -263,7 +263,7 @@
+             tokio::sync::mpsc::UnboundedSender<WriterRequest>,
+             ChunkInfo,
+         )>();
+-        let ratelimits = Limits::new(paused.shared.options.ratelimits);
++        let ratelimits = paused.shared.ratelimits.clone();
+ 
+         let state = Arc::new(TorrentStateLive {
+             shared: paused.shared.clone(),
+diff -ru a/src/torrent_state/mod.rs b/src/torrent_state/mod.rs
+--- a/src/torrent_state/mod.rs	2006-07-23 18:21:28.000000000 -0700
++++ b/src/torrent_state/mod.rs	2026-11-03 16:31:19.043044600 -0800
+@@ -10,7 +10,7 @@
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+ use std::sync::Weak;
+-use std::sync::atomic::Ordering;
++use std::sync::atomic::{AtomicBool, Ordering};
+ use std::time::Duration;
+ 
+ use anyhow::Context;
+@@ -40,7 +40,7 @@
+ use crate::Session;
+ use crate::chunk_tracker::ChunkTracker;
+ use crate::file_info::FileInfo;
+-use crate::limits::LimitsConfig;
++use crate::limits::Limits;
+ use crate::session::TorrentId;
+ use crate::spawn_utils::BlockingSpawner;
+ use crate::storage::BoxStorageFactory;
+@@ -115,22 +115,14 @@
+     pub peer_max_request_window: Option<usize>,
+     pub allow_overwrite: bool,
+     pub output_folder: PathBuf,
+-    pub ratelimits: LimitsConfig,
+     pub initial_peers: Vec<SocketAddr>,
+     pub peer_limit: Option<usize>,
+-    #[cfg(feature = "disable-upload")]
+-    pub _disable_upload: bool,
++    pub disable_upload: AtomicBool,
+ }
+ 
+ impl ManagedTorrentOptions {
+-    #[cfg(feature = "disable-upload")]
+     pub fn disable_upload(&self) -> bool {
+-        self._disable_upload
+-    }
+-
+-    #[cfg(not(feature = "disable-upload"))]
+-    pub const fn disable_upload(&self) -> bool {
+-        false
++        self.disable_upload.load(Ordering::Relaxed)
+     }
+ }
+ 
+@@ -187,6 +179,8 @@
+     pub peer_id: Id20,
+     pub span: tracing::Span,
+     pub(crate) options: ManagedTorrentOptions,
++    /// Kept here rather than in the live state, so a change outlives pausing.
++    pub(crate) ratelimits: Arc<Limits>,
+     pub(crate) connector: Arc<StreamConnector>,
+     pub(crate) storage_factory: BoxStorageFactory,
+     pub(crate) session: Weak<Session>,
+@@ -233,6 +227,23 @@
+     }
+ 
+     /// The resolved on-disk folder this torrent's files are written under.
++    pub fn upload_disabled(&self) -> bool {
++        self.shared.options.disable_upload()
++    }
++
++    /// Takes effect for peers that connect afterwards; returns whether it changed.
++    pub fn set_upload_disabled(&self, disabled: bool) -> bool {
++        self.shared
++            .options
++            .disable_upload
++            .swap(disabled, Ordering::Relaxed)
++            != disabled
++    }
++
++    pub fn ratelimits(&self) -> &Limits {
++        &self.shared.ratelimits
++    }
++
+     pub fn output_folder(&self) -> &Path {
+         &self.shared.options.output_folder
+     }
