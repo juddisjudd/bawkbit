@@ -30,6 +30,12 @@ pub struct Settings {
     pub seed_minutes: u32,
     /// A folder whose .torrent files are added on their own; empty turns it off.
     pub watch_dir: String,
+    /// Also connects to peers over uTP, which the engine still calls new.
+    pub utp: bool,
+    /// A program run each time a torrent finishes downloading; clients can read it but only the desktop app sets it.
+    pub on_finish: String,
+    /// Minutes between checks of each RSS feed.
+    pub rss_minutes: u32,
     pub web: Web,
     /// Prowlarr and Jackett servers that search answers come from.
     pub indexers: Vec<Indexer>,
@@ -54,6 +60,9 @@ impl Default for Settings {
             ratio_limit: 0.0,
             seed_minutes: 0,
             watch_dir: String::new(),
+            utp: false,
+            on_finish: String::new(),
+            rss_minutes: 30,
             web: Web::default(),
             indexers: Vec::new(),
         }
@@ -217,6 +226,7 @@ impl Settings {
     /// Takes a client's settings, keeping what clients never see.
     pub fn merge_from_client(&self, mut incoming: Settings) -> Settings {
         incoming.web.password_hash = self.web.password_hash.clone();
+        incoming.on_finish = self.on_finish.clone();
         for indexer in &mut incoming.indexers {
             if indexer.id.is_empty() {
                 indexer.id = new_id();
@@ -248,6 +258,7 @@ impl Settings {
             || self.upnp != other.upnp
             || self.dht != other.dht
             || self.peer_limit != other.peer_limit
+            || self.utp != other.utp
     }
 }
 

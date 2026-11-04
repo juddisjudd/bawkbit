@@ -5,9 +5,10 @@ mod filter;
 mod kit;
 mod list;
 mod prompts;
+mod rss;
 mod search;
 mod settings;
-mod updates;
+pub mod updates;
 
 use bawkbit_core::{Action, AddRequest, Source};
 use gpui_kit::component::notification::Notification;
@@ -23,6 +24,7 @@ use add::{AddDone, AddView};
 use details::{DetailsEvent, DetailsView};
 use filter::Status;
 use list::{ListEvent, TorrentList};
+use rss::{RssEvent, RssView};
 use search::{SearchEvent, SearchView};
 use settings::{SettingsEvent, SettingsView};
 use updates::{UpdateFound, Updates};
@@ -31,6 +33,7 @@ use updates::{UpdateFound, Updates};
 pub enum Page {
     Torrents,
     Search,
+    Rss,
     Settings,
 }
 
@@ -56,34 +59,32 @@ pub fn act<V: 'static>(
 
 pub struct Workspace {
     engine: Entity<Engine>,
-    config: Config,
     page: Page,
     list: Entity<TorrentList>,
     details: Entity<DetailsView>,
     search: Entity<SearchView>,
+    rss: Entity<RssView>,
     settings: Entity<SettingsView>,
     updates: Entity<Updates>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
-    _inbox: Task<()>,
 }
 
 impl Workspace {
     pub fn new(
         engine: Entity<Engine>,
+        updates: Entity<Updates>,
         args: Vec<String>,
-        inbox: async_channel::Receiver<Vec<String>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let config = Config::load();
+        let config = cx.global::<Config>().clone();
         theme::apply(&config.theme, config.mode, Some(window), cx);
 
         let list = cx.new(|cx| TorrentList::new(engine.clone(), &config, window, cx));
         let details = cx.new(|cx| DetailsView::new(engine.clone(), cx));
         let search = cx.new(|cx| SearchView::new(engine.clone(), window, cx));
-        let runtime = engine.read(cx).runtime();
-        let updates = cx.new(|cx| Updates::new(config.check_updates, runtime, cx));
+        let rss = cx.new(|cx| RssView::new(engine.clone(), window, cx));
         let settings =
             cx.new(|cx| SettingsView::new(engine.clone(), updates.clone(), &config, window, cx));
 
@@ -92,6 +93,13 @@ impl Workspace {
             cx.subscribe_in(&list, window, Self::on_list),
             cx.subscribe_in(&settings, window, Self::on_settings),
             cx.subscribe_in(&search, window, Self::on_search),
+            cx.subscribe_in(
+                &rss,
+                window,
+                |this, _, event: &RssEvent, window, cx| match event {
+                    RssEvent::Add(link) => this.add_source(Source::Link(link.clone()), window, cx),
+                },
+            ),
             cx.subscribe_in(&updates, window, |_, _, found: &UpdateFound, window, cx| {
                 let note = format!(
                     "bawkbit {} is out. open settings → about to update.",
@@ -103,38 +111,26 @@ impl Workspace {
             cx.subscribe(&details, |this, _, _: &DetailsEvent, cx| {
                 this.list.update(cx, |list, cx| list.clear_focus(cx));
             }),
-            cx.observe_window_appearance(window, |this, window, cx| {
-                if this.config.mode == Mode::System {
-                    theme::apply(&this.config.theme, Mode::System, Some(window), cx);
+            cx.observe_window_appearance(window, |_, window, cx| {
+                let config = cx.global::<Config>();
+                if config.mode == Mode::System {
+                    let theme = config.theme.clone();
+                    theme::apply(&theme, Mode::System, Some(window), cx);
                 }
             }),
-            cx.on_app_quit(|this, cx| this.engine.read(cx).shutdown()),
         ];
-
-        let inbox = cx.spawn_in(window, async move |this, cx| {
-            while let Ok(args) = inbox.recv().await {
-                let alive = this.update_in(cx, |this, window, cx| {
-                    window.activate_window();
-                    this.open_links(args, window, cx);
-                });
-                if alive.is_err() {
-                    break;
-                }
-            }
-        });
 
         let this = Self {
             engine,
-            config,
             page: Page::Torrents,
             list,
             details,
             search,
+            rss,
             settings,
             updates,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
-            _inbox: inbox,
         };
         window.focus(&this.focus, cx);
         if !args.is_empty() {
@@ -158,9 +154,11 @@ impl Workspace {
                 self.details.update(cx, |details, cx| details.show(id, cx));
             }
             ListEvent::Sorted(column, descending) => {
-                self.config.sort = *column;
-                self.config.descending = *descending;
-                self.config.save();
+                let (column, descending) = (*column, *descending);
+                Config::edit(cx, |config| {
+                    config.sort = column;
+                    config.descending = descending;
+                });
             }
             ListEvent::Add => self.open_add(None, window, cx),
         }
@@ -198,19 +196,27 @@ impl Workspace {
     ) {
         match event {
             SettingsEvent::Theme(id, mode) => {
-                self.config.theme = id.to_string();
-                self.config.mode = *mode;
-                theme::apply(id, *mode, Some(window), cx);
+                let (theme, mode) = (id.to_string(), *mode);
+                theme::apply(&theme, mode, Some(window), cx);
+                Config::edit(cx, |config| {
+                    config.theme = theme;
+                    config.mode = mode;
+                });
             }
-            SettingsEvent::QuickAdd(on) => self.config.quick_add = *on,
-            SettingsEvent::CheckUpdates(on) => self.config.check_updates = *on,
+            SettingsEvent::QuickAdd(on) => {
+                let on = *on;
+                Config::edit(cx, |config| config.quick_add = on);
+            }
+            SettingsEvent::CheckUpdates(on) => {
+                let on = *on;
+                Config::edit(cx, |config| config.check_updates = on);
+            }
         }
-        self.config.save();
         cx.notify();
     }
 
     /// Opens the add dialog for each link or file, or adds magnets straight away when quick add is on.
-    fn open_links(&mut self, links: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_links(&mut self, links: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         for link in links {
             let source = if link.starts_with("magnet:") || link.contains("://") {
                 Source::Link(link)
@@ -232,7 +238,7 @@ impl Workspace {
 
     fn add_source(&mut self, source: Source, window: &mut Window, cx: &mut Context<Self>) {
         let magnet = matches!(&source, Source::Link(link) if link.starts_with("magnet:"));
-        if self.config.quick_add && magnet {
+        if cx.global::<Config>().quick_add && magnet {
             let request = AddRequest {
                 source,
                 save_path: None,
@@ -240,6 +246,7 @@ impl Workspace {
                 tags: Vec::new(),
                 paused: None,
                 files: None,
+                skip_check: false,
             };
             let job = self
                 .engine
@@ -305,9 +312,24 @@ impl Workspace {
                 let focus = self.search.read(cx).focus_handle(cx);
                 window.focus(&focus, cx);
             }
+            Page::Rss => {
+                let focus = self.rss.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
             Page::Settings => {}
         }
         cx.notify();
+    }
+
+    pub fn reveal(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.list.update(cx, |list, cx| list.reveal(id, cx));
+        self.select(Page::Torrents, window, cx);
+    }
+
+    pub fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings
+            .update(cx, |settings, cx| settings.show_about(cx));
+        self.select(Page::Settings, window, cx);
     }
 
     pub fn set_status(&mut self, status: Status, window: &mut Window, cx: &mut Context<Self>) {
@@ -390,6 +412,7 @@ impl Render for Workspace {
         let content = match self.page {
             Page::Settings => self.settings.clone().into_any_element(),
             Page::Search => self.search.clone().into_any_element(),
+            Page::Rss => self.rss.clone().into_any_element(),
             Page::Torrents => v_resizable("split")
                 .child(
                     resizable_panel()

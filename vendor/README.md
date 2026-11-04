@@ -8,6 +8,7 @@ The changes:
 
 - Each torrent has an upload switch that can change while it runs: `ManagedTorrent::set_upload_disabled`. With it on, the torrent never tells peers which pieces it has. Stock librqbit has this switch only for the whole session, and only at build time.
 - Each torrent keeps its speed limits outside its running state, so they can change at any time and outlast a pause: `ManagedTorrent::ratelimits`.
+- Torrents can share a second set of limits, so a group of them stays under one speed together: `ManagedTorrent::set_group_ratelimits`. bawkbit uses it for category limits.
 - A rate limit always lets at least 128 KiB through at once. Before, a limit below one request (16 KiB/s) failed every request and dropped the peer.
 
 ### Upgrading librqbit

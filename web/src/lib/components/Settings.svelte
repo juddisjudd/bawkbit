@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Archive from '@lucide/svelte/icons/archive'
   import Download from '@lucide/svelte/icons/download'
   import Gauge from '@lucide/svelte/icons/gauge'
   import Globe from '@lucide/svelte/icons/globe'
@@ -7,8 +8,10 @@
   import Network from '@lucide/svelte/icons/network'
   import Palette from '@lucide/svelte/icons/palette'
   import Plus from '@lucide/svelte/icons/plus'
+  import RssIcon from '@lucide/svelte/icons/rss'
   import Search from '@lucide/svelte/icons/search'
   import Trash from '@lucide/svelte/icons/trash-2'
+  import Upload from '@lucide/svelte/icons/upload'
   import type { Component } from 'svelte'
   import { api, type Indexer, type IndexerKind, type Settings } from '$lib/api'
   import { limitBytes, limitUnit, limitValue } from '$lib/format'
@@ -23,8 +26,20 @@
     { id: 'speed', label: 'speed', icon: Gauge },
     { id: 'queue', label: 'queue', icon: ListOrdered },
     { id: 'search', label: 'search', icon: Search },
+    { id: 'rss', label: 'rss', icon: RssIcon },
     { id: 'web', label: 'web UI', icon: Globe },
+    { id: 'backup', label: 'backup', icon: Archive },
     { id: 'appearance', label: 'appearance', icon: Palette }
+  ]
+  const placeholders: [string, string][] = [
+    ['%N', 'name'],
+    ['%F', 'content path'],
+    ['%D', 'folder'],
+    ['%L', 'category'],
+    ['%G', 'tags'],
+    ['%Z', 'size'],
+    ['%C', 'file count'],
+    ['%I', 'id']
   ]
   const themes: { id: ThemeChoice; label: string }[] = [
     { id: 'system', label: 'system' },
@@ -86,7 +101,7 @@
     return n
   }
 
-  function setNumber(key: 'listen_port' | 'peer_limit' | 'max_active_downloads' | 'seed_minutes', value: string, min: number, max: number, label: string): void {
+  function setNumber(key: 'listen_port' | 'peer_limit' | 'max_active_downloads' | 'seed_minutes' | 'rss_minutes', value: string, min: number, max: number, label: string): void {
     const n = int(value, key === 'listen_port' ? 1 : 0, max)
     if (n === null || (key === 'listen_port' && n === 0)) {
       show(`${label}: use a whole number from ${min} to ${max}.`, true)
@@ -169,6 +184,50 @@
     }
   }
 
+  let backupInput = $state<HTMLInputElement>()
+
+  async function exportBackup(): Promise<void> {
+    try {
+      const backup = await api.backup()
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = 'bawkbit-backup.json'
+      link.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (err) {
+      show((err as Error).message, true)
+    }
+  }
+
+  async function importBackup(file: File | undefined): Promise<void> {
+    if (backupInput) backupInput.value = ''
+    if (!file) return
+    let backup: unknown
+    try {
+      backup = JSON.parse(await file.text())
+    } catch {
+      show('that file is not a bawkbit backup.', true)
+      return
+    }
+    app.confirm = {
+      message: `restore ${file.name}? its settings replace these; its categories, tags, feeds and rules are added to yours.`,
+      confirm: 'restore',
+      run: async () => {
+        try {
+          await api.restore(backup)
+          draft = await api.settings()
+          app.defaults = draft
+          void app.loadRss()
+          show('restored', false)
+        } catch (err) {
+          show((err as Error).message, true)
+        }
+      }
+    }
+  }
+
   function changePassword(event: SubmitEvent): void {
     event.preventDefault()
     if (password.length < 8) {
@@ -220,6 +279,15 @@
       <div class="checks">
         <Checkbox checked={draft.start_paused} label="add torrents paused" onchange={(v) => save((s) => (s.start_paused = v))} />
       </div>
+      <h3>when a download finishes</h3>
+      <div class="field">
+        <label class="label" for="on-finish">run</label>
+        <input id="on-finish" class="input" readonly spellcheck="false" placeholder="nothing" aria-describedby="on-finish-hint" value={draft.on_finish} />
+        <span class="hint" id="on-finish-hint">set in the bawkbit desktop app or in settings.json, since it runs a program on that computer.</span>
+        <span class="hint placeholders">
+          {#each placeholders as [code, meaning] (code)}<span><code>{code}</code> {meaning}</span>{/each}
+        </span>
+      </div>
     {:else if app.settingsTab === 'connection'}
       <label class="row">
         <span>listening port</span>
@@ -240,6 +308,8 @@
       <div class="checks">
         <Checkbox checked={draft.upnp} label="open the port on the router (UPnP)" onchange={(v) => save((s) => (s.upnp = v))} />
         <Checkbox checked={draft.dht} label="find peers without trackers (DHT)" onchange={(v) => save((s) => (s.dht = v))} />
+        <Checkbox checked={draft.utp} label="uTP" onchange={(v) => save((s) => (s.utp = v))} />
+        <span class="hint indent">also connect to peers over uTP. the engine still calls it new.</span>
       </div>
       {#if app.snapshot && !app.snapshot.totals.port}
         <p class="hint warn">bawkbit is not listening for incoming peers. another program may be using the port.</p>
@@ -362,6 +432,33 @@
         <button type="button" class="btn" onclick={() => addIndexer('jackett')}><Plus />add jackett</button>
       </div>
       <p class="hint">the API key is in prowlarr under settings → general, and at the top right of jackett's dashboard.</p>
+    {:else if app.settingsTab === 'rss'}
+      <label class="row">
+        <span>check feeds every</span>
+        <span class="inline">
+          <input
+            class="input narrow num"
+            type="number"
+            min="0"
+            max="10080"
+            placeholder="by hand"
+            value={draft.rss_minutes || ''}
+            onchange={(e) => setNumber('rss_minutes', e.currentTarget.value, 0, 10080, 'minutes')}
+          />
+          <span class="muted">min</span>
+        </span>
+      </label>
+      <p class="hint">empty checks only when you press refresh. bawkbit waits at least 5 minutes between checks of one feed.</p>
+      <div class="inline adds">
+        <button type="button" class="btn" onclick={() => app.openRss()}><RssIcon />feeds and rules</button>
+      </div>
+    {:else if app.settingsTab === 'backup'}
+      <p class="hint">settings, categories, tags, feeds and rules, to move to another computer. passwords and API keys are left out.</p>
+      <div class="inline adds">
+        <button type="button" class="btn" onclick={exportBackup}><Download />export</button>
+        <button type="button" class="btn" onclick={() => backupInput?.click()}><Upload />import</button>
+      </div>
+      <input bind:this={backupInput} type="file" accept=".json,application/json" hidden onchange={(e) => void importBackup(e.currentTarget.files?.[0])} />
     {:else if app.settingsTab === 'web'}
       <div class="checks">
         <Checkbox checked={draft.web.enabled} label="web UI on" onchange={(v) => (v ? save((s) => (s.web.enabled = v)) : risky('turn off the web UI? this page stops working until it is turned on in the bawkbit app.', 'turn off', (s) => (s.web.enabled = false)))} />
@@ -530,6 +627,18 @@
   }
   .hint.warn {
     color: var(--warning);
+  }
+  .hint.indent {
+    margin: -4px 0 0 28px;
+  }
+  .placeholders {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 14px;
+  }
+  code {
+    color: var(--text);
+    font-family: inherit;
   }
   .row {
     display: flex;

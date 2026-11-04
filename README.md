@@ -51,6 +51,33 @@ bawkbit searches through [Prowlarr](https://prowlarr.com) or [Jackett](https://g
 
 Results come from every source you turn on at once. A torrent that several trackers list shows once. Type in the refine box to narrow the results: `-word` leaves a word out, and `>1GB` or `<500MB` limits the size.
 
+### RSS
+
+bawkbit reads RSS and Atom feeds, including the RSS feeds that Prowlarr, Jackett and most trackers give out, and adds new items that match your rules.
+
+1. Open **rss**, paste a feed address into the box at the top left and press Enter.
+2. Open **rules** and press **new rule**.
+3. Type a name and the words a title must contain, such as `show 1080p`. `|` separates choices and `*` matches anything. Turn on **regular expressions** to write a regex instead.
+4. Pick a category or folder, then press **save**. The list under the rule shows what in the feeds matches now.
+
+A rule takes only items that arrive after it, so it never adds a whole feed's backlog. Click an item in a feed to add it by hand. **each episode once** skips an episode the rule already took, such as `S01E02` in a second quality. bawkbit checks each feed every 30 minutes; change it under **settings → downloads**.
+
+### When a download finishes
+
+The desktop app shows a notification. To run a program as well, type it under **settings → downloads → when one finishes, run**, for example:
+
+```
+C:\scripts\done.bat "%F" "%L"
+```
+
+`%N` is the torrent's name, `%F` its file or folder, `%D` the folder that holds it, `%L` its category, `%G` its tags, `%Z` its size in bytes, `%C` its file count and `%I` its id. The program also gets them as `BAWKBIT_NAME`, `BAWKBIT_CONTENT`, `BAWKBIT_FOLDER`, `BAWKBIT_CATEGORY`, `BAWKBIT_TAGS`, `BAWKBIT_SIZE` and `BAWKBIT_ID`. bawkbit starts it directly, without a shell, so a torrent's name can never run as a command. The web UI shows this setting but cannot change it, because anyone who can change it can run programs on the computer. With `bawkbitd`, set `on_finish` in `settings.json` while it is stopped.
+
+### In the tray
+
+bawkbit puts an icon in the system tray. Its menu opens the window, pauses or resumes everything and turns the alternative speeds on and off. Closing the window leaves bawkbit downloading and seeding in the tray; quit from the tray menu. Under **settings → app** you can turn the icon off, make closing the window quit, and start bawkbit when you log in. It then starts in the tray.
+
+On Linux the icon needs a desktop with a system tray, such as KDE, or GNOME with the AppIndicator extension. Without one, closing the window quits.
+
 ### Updates
 
 bawkbit asks GitHub for a new version once a day. When there is one, a dot shows on **settings**. Open **settings → about**, press **update**, then **restart now**. bawkbit checks the download against its SHA-256 checksum before it replaces anything, and your torrents carry on after the restart.
@@ -97,16 +124,21 @@ Double-click a torrent to open its folder. Right-click it for everything else.
 ## What it does
 
 - **Adds** magnet links, links to `.torrent` files and `.torrent` files. You see the file list first and pick what to download. Magnet links can also go straight in (**settings → downloads → add magnets without asking**).
+- **Skip check**: in the add dialog, trust files that are already complete, such as for cross-seeding. A spot check still runs, and a full check takes over when it finds a bad piece.
 - **Search** your Prowlarr or Jackett, with results from every tracker merged into one list.
-- **Categories** with their own folder, and **tags**. Filter the list by status, category and tag at once.
+- **RSS** feeds with rules that add new items on their own.
+- **Categories** with their own folder and their own shared speed limits, and **tags**. Right-click one in the sidebar to rename it. Filter the list by status, category and tag at once.
 - **Speed limits**, with alternative limits behind the turtle in the title bar and a schedule that switches to them.
 - **A queue**: only so many downloads run at once, the rest wait their turn.
 - **Seeding goals**: stop at a ratio or after a time.
 - **A watch folder**: `.torrent` files put there are added on their own.
 - **Details** for each torrent: a piece map, files with per-file progress and selection, peers, and trackers you can add and remove.
 - **Per torrent**, from the right-click menu: force start past the queue, re-check, no upload, its own speed limits, and more trackers. A torrent keeps what it has downloaded when you add trackers.
-- **DHT**, UPnP port forwarding and peer exchange through the engine.
+- **DHT**, UPnP port forwarding and peer exchange through the engine, and uTP if you turn it on under **settings → connection**.
+- **When a download finishes**: a notification, and a program of your choice.
+- **The tray**: bawkbit keeps running there with the window closed, and can start when you log in.
 - **One instance**: opening a magnet link while bawkbit runs hands it to the open window.
+- **Backup**: export the settings, categories, tags and RSS to a file, and import them on another computer (**settings → about**). Passwords and API keys stay out of the file.
 - **Updates itself** from the releases page, after checking each download's checksum.
 - **Themes**: dark, light, follow your system, or one of 30 named themes.
 
@@ -119,6 +151,7 @@ bawkbit takes its ideas from two older clients. From [qBittorrent](https://githu
 | Downloads (change it under settings) | `Downloads\bawkbit` | `~/Downloads/bawkbit` |
 | Engine settings | `%APPDATA%\bawkbit\settings.json` | `~/.config/bawkbit/settings.json` |
 | Categories, tags and torrent history | `%APPDATA%\bawkbit\torrents.json` | `~/.config/bawkbit/torrents.json` |
+| RSS feeds and rules | `%APPDATA%\bawkbit\rss.json` | `~/.config/bawkbit/rss.json` |
 | The torrents themselves, for resuming | `%APPDATA%\bawkbit\session` | `~/.config/bawkbit/session` |
 | Desktop app look and sort order | `%APPDATA%\bawkbit\desktop.json` | `~/.config/bawkbit/desktop.json` |
 
@@ -155,12 +188,12 @@ $env:LOG_LEVEL = "DEBUG"; $env:LOG_FILE = "$env:TEMP\bawkbit.log"; cargo run
 
 | Part | What it is |
 | --- | --- |
-| [`crates/core`](crates/core) | The engine: torrents, settings, the queue, seeding goals, the schedule and the watch folder. Every client talks to it through the types in `api.rs`. |
+| [`crates/core`](crates/core) | The engine: torrents, settings, the queue, seeding goals, the schedule, the watch folder and RSS. Every client talks to it through the types in `api.rs`. |
 | [`crates/web`](crates/web) | The HTTP API and the web UI server, with login, live updates and the built web UI inside. |
 | [`crates/daemon`](crates/daemon) | `bawkbitd`, the engine and the web UI without a window. |
 | [`src`](src) | The desktop app, drawn with GPUI. |
 | [`web`](web) | The web UI, in Svelte. See [web/README.md](web/README.md). |
-| [`vendor`](vendor) | librqbit with a small patch for per-torrent upload and speed limits. See [vendor/README.md](vendor/README.md). |
+| [`vendor`](vendor) | librqbit with a small patch for per-torrent upload and speed limits, and limits shared by a category. See [vendor/README.md](vendor/README.md). |
 
 ### Builds and releases
 
@@ -183,14 +216,17 @@ The web UI uses this API, and so can your scripts. Log in with `POST /api/login`
 | Request | Does |
 | --- | --- |
 | `GET /api/snapshot` | every torrent, the speeds, categories and tags |
-| `GET /api/events` | the same snapshot once a second, as server-sent events |
+| `GET /api/events` | the same snapshot once a second, and a `finished` event for each finished download, as server-sent events |
 | `GET /api/torrents/{id}` | one torrent's files, peers, trackers and piece map |
 | `POST /api/preview` | reads a magnet link or `.torrent` file without adding it |
-| `POST /api/torrents` | adds a torrent |
+| `POST /api/torrents` | adds a torrent; `skip_check` trusts files already on disk |
 | `POST /api/search` | searches every turned-on Prowlarr and Jackett |
 | `POST /api/indexers/test` | checks a Prowlarr or Jackett address and key |
-| `POST /api/actions` | pause, resume, force start, re-check, remove, set files, trackers, no upload, speed limits, categories, tags and the alternative limits |
+| `POST /api/actions` | pause, resume, force start, re-check, remove, set files, trackers, no upload, speed limits, categories and their limits, tags, renames and the alternative limits |
 | `GET` or `PUT /api/settings` | reads or changes the engine settings |
+| `GET` or `POST /api/rss` | reads the feeds and rules, or changes them |
+| `POST /api/rss/matches` | what a rule would take from the feeds now |
+| `GET` or `POST /api/backup` | exports the settings, categories, tags and RSS, or imports them |
 
 The request and answer shapes are in [`crates/core/src/api.rs`](crates/core/src/api.rs). A torrent's `id` is its info hash.
 

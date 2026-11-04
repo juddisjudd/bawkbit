@@ -1,5 +1,5 @@
 import { SvelteSet } from 'svelte/reactivity'
-import { api, isLink, whenUnauthorized, type Action, type Id, type SearchCategory, type SearchReply, type SearchResult, type SessionInfo, type Settings, type Snapshot, type Torrent } from './api'
+import { api, isLink, whenUnauthorized, type Action, type Finished, type Id, type Rss, type RssAction, type SearchCategory, type SearchReply, type SearchResult, type SessionInfo, type Settings, type Snapshot, type Torrent } from './api'
 import { COMPARE_RESULTS, parseRefine, refines, type SearchSortKey } from './search'
 import { isRunning } from './states'
 
@@ -7,8 +7,9 @@ export type StatusFilter = 'all' | 'downloading' | 'seeding' | 'done' | 'paused'
 export type SortKey = 'name' | 'size' | 'progress' | 'down' | 'up' | 'eta' | 'ratio' | 'peers' | 'added'
 export type ThemeChoice = 'system' | 'dark' | 'light'
 export type DetailsTab = 'overview' | 'files' | 'peers' | 'trackers'
-export type View = 'list' | 'search' | 'settings'
-export type SettingsTab = 'downloads' | 'connection' | 'speed' | 'queue' | 'search' | 'web' | 'appearance'
+export type View = 'list' | 'search' | 'rss' | 'settings'
+export type SettingsTab = 'downloads' | 'connection' | 'speed' | 'queue' | 'search' | 'rss' | 'web' | 'backup' | 'appearance'
+export type RssTab = 'feeds' | 'rules'
 
 export interface MenuItem {
   label: string
@@ -40,11 +41,12 @@ export interface Prompt {
   run: (value: string) => void
 }
 
-/** Bytes per second, 0 for no limit. */
+/** Bytes per second, 0 for no limit; a category's limits are shared by every torrent in it. */
 export interface LimitsEdit {
   ids: Id[]
   down: number
   up: number
+  category?: string
 }
 
 export interface AddIntent {
@@ -135,6 +137,15 @@ class App {
   refine = $state('')
   searchSort = $state<{ key: SearchSortKey; desc: boolean }>(stored('searchSort', { key: 'seeds', desc: true }))
   private searchAttempt = 0
+
+  rss = $state.raw<Rss | null>(null)
+  rssError = $state('')
+  rssTab = $state<RssTab>('feeds')
+  rssFeed = $state<string | null>(null)
+  /** The rule open in the editor; '' is a new one. */
+  rssRule = $state<string | null>(null)
+  private rssRev = -1
+  private rssLoading = false
 
   theme = $state<ThemeChoice>(stored('theme', 'system'))
   defaults = $state.raw<Settings | null>(null)
@@ -252,6 +263,11 @@ class App {
       this.lastEvent = Date.now()
       this.snapshot = JSON.parse((event as MessageEvent<string>).data) as Snapshot
       this.live = 'live'
+      if ((this.rss !== null || this.view === 'rss') && this.snapshot.rss_rev !== this.rssRev) void this.loadRss()
+    })
+    source.addEventListener('finished', (event) => {
+      const done = JSON.parse((event as MessageEvent<string>).data) as Finished
+      this.toast(`${done.name} finished`)
     })
     source.onerror = () => this.lost(source)
     if (this.watchdog) clearInterval(this.watchdog)
@@ -414,6 +430,37 @@ class App {
     return this.act({ action: 'set_limits', ids, down, up })
   }
 
+  editCategoryLimits(name: string): void {
+    const category = this.snapshot?.categories.find((c) => c.name === name)
+    if (category) this.limits = { ids: [], down: category.down_limit, up: category.up_limit, category: name }
+  }
+
+  renameCategory(name: string): void {
+    this.prompt = {
+      placeholder: 'category name',
+      value: name,
+      submit: 'rename',
+      run: async (value) => {
+        const to = value.trim()
+        if (!to || to === name) return
+        if ((await this.act({ action: 'rename_category', from: name, to })) && this.category === name) this.category = to
+      }
+    }
+  }
+
+  renameTag(tag: string): void {
+    this.prompt = {
+      placeholder: 'tag name',
+      value: tag,
+      submit: 'rename',
+      run: async (value) => {
+        const to = value.trim()
+        if (!to || to === tag) return
+        if ((await this.act({ action: 'rename_tag', from: tag, to })) && this.tag === tag) this.tag = to
+      }
+    }
+  }
+
   /** Adds addresses, one per line, to the trackers the torrent has now. */
   async addTrackers(id: Id, text: string): Promise<boolean> {
     const fresh = text.split(/\s+/).map((line) => line.trim()).filter(Boolean)
@@ -486,6 +533,38 @@ class App {
   openSearch(): void {
     this.view = 'search'
     this.filtersOpen = false
+  }
+
+  openRss(): void {
+    this.view = 'rss'
+    this.filtersOpen = false
+    void this.loadRss()
+  }
+
+  async loadRss(): Promise<void> {
+    if (this.rssLoading) return
+    this.rssLoading = true
+    const rev = this.snapshot?.rss_rev ?? -1
+    try {
+      this.rss = await api.rss()
+      this.rssRev = rev
+      this.rssError = ''
+    } catch (error) {
+      this.rssError = (error as Error).message
+    } finally {
+      this.rssLoading = false
+    }
+  }
+
+  async rssAct(action: RssAction, success?: string): Promise<boolean> {
+    try {
+      this.rss = await api.rssAct(action)
+      if (success) this.toast(success)
+      return true
+    } catch (error) {
+      this.toast((error as Error).message, true)
+      return false
+    }
   }
 
   async search(): Promise<void> {

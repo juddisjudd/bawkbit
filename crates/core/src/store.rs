@@ -3,7 +3,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::Id;
+use crate::api::{AddRequest, Id};
 
 /// What bawkbit knows about its torrents beyond what the engine keeps.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -12,7 +12,17 @@ pub struct Store {
     pub torrents: HashMap<Id, Entry>,
     /// Category name to its save path; an empty path means a folder of that name in the download folder.
     pub categories: BTreeMap<String, String>,
+    /// Category name to the download and upload limits its torrents share, in bytes per second.
+    pub category_limits: BTreeMap<String, (u64, u64)>,
     pub tags: BTreeSet<String>,
+    /// Magnet links still fetching their file list, which the engine itself does not keep across a restart.
+    pub waiting: BTreeMap<Id, Waiting>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Waiting {
+    pub added: i64,
+    pub request: AddRequest,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

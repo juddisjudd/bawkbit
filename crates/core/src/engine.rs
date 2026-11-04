@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv6Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -11,19 +12,20 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use bytes::Bytes;
 use librqbit::api::TorrentIdOrHash;
 use librqbit::dht::{DhtPersistenceConfig, Id20};
-use librqbit::limits::LimitsConfig;
+use librqbit::limits::{Limits, LimitsConfig};
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, DhtSessionConfig, ListenerMode,
     ListenerOptions, ManagedTorrent, Session, SessionOptions, SessionPersistenceConfig,
     TorrentStatsState,
 };
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::api::*;
 use crate::magnet;
+use crate::rss::Feeds;
 use crate::search;
 use crate::settings::{Indexer, Settings};
-use crate::store::{Entry, Store};
+use crate::store::{Entry, Store, Waiting};
 
 const HISTORY: usize = 300;
 const PIECE_MAP: usize = 400;
@@ -36,6 +38,7 @@ struct Paths {
     store: PathBuf,
     session: PathBuf,
     dht: PathBuf,
+    rss: PathBuf,
 }
 
 impl Paths {
@@ -45,8 +48,23 @@ impl Paths {
             store: root.join("torrents.json"),
             session: root.join("session"),
             dht: root.join("dht.json"),
+            rss: root.join("rss.json"),
         }
     }
+}
+
+/// A torrent that just finished, with what the finish program is told about it.
+struct Done {
+    id: Id,
+    name: String,
+    category: Option<String>,
+    tags: Vec<String>,
+    /// The file, or the folder of a torrent with several.
+    content: PathBuf,
+    /// The folder that holds `content`.
+    folder: PathBuf,
+    size: u64,
+    files: usize,
 }
 
 /// A torrent whose metadata was fetched but which is not added yet.
@@ -79,6 +97,10 @@ struct Live {
     applied_limits: Option<(u64, u64)>,
     free_space: Option<u64>,
     ticks: u64,
+    /// Torrents seen downloading, so one counts as finished only when it gets there while bawkbit watches.
+    downloading: HashSet<Id>,
+    /// The limits each limited category's torrents share.
+    groups: HashMap<String, Arc<Limits>>,
 }
 
 /// One running engine; cheap to clone and safe to share between the desktop app, the web server and the daemon.
@@ -100,6 +122,8 @@ struct Inner {
     rev: AtomicU64,
     rebuilding: tokio::sync::Mutex<()>,
     http: reqwest::Client,
+    feeds: Feeds,
+    finished: broadcast::Sender<Finished>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -127,6 +151,7 @@ impl Core {
         let store = Store::load(&paths.store);
         let session = build_session(&paths, &settings).await?;
         let (snapshot, _) = watch::channel(Arc::new(Snapshot::default()));
+        let feeds = Feeds::load(paths.rss.clone());
 
         let core = Core {
             inner: Arc::new(Inner {
@@ -142,9 +167,12 @@ impl Core {
                 rev: AtomicU64::new(0),
                 rebuilding: tokio::sync::Mutex::new(()),
                 http: search::client(),
+                feeds,
+                finished: broadcast::channel(64).0,
             }),
         };
         core.tick().await;
+        core.resume_waiting();
         let ticker = core.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -154,11 +182,167 @@ impl Core {
                 ticker.tick().await;
             }
         });
+        let reader = core.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let minutes = reader.settings().rss_minutes;
+                for id in reader.inner.feeds.due(minutes) {
+                    reader.spawn_refresh(id);
+                }
+            }
+        });
         Ok(core)
+    }
+
+    /// Picks up the magnet links that were still fetching their file list when bawkbit last stopped.
+    fn resume_waiting(&self) {
+        let waiting = lock(&self.inner.store).waiting.clone();
+        for (id, waiting) in waiting {
+            let info = match &waiting.request.source {
+                Source::Link(link) => magnet::parse(link),
+                _ => None,
+            };
+            match info {
+                Some(info) if self.handle(&id).is_err() => {
+                    self.add_in_background(info, waiting.request, waiting.added)
+                }
+                _ => {
+                    self.edit_store(|store| store.waiting.remove(&id));
+                }
+            }
+        }
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Arc<Snapshot>> {
         self.inner.snapshot.subscribe()
+    }
+
+    /// Each torrent that finishes downloading from now on.
+    pub fn subscribe_finished(&self) -> broadcast::Receiver<Finished> {
+        self.inner.finished.subscribe()
+    }
+
+    /// Sets the program run when a torrent finishes, which clients cannot change through `update_settings`.
+    pub fn set_on_finish(&self, command: String) -> Result<()> {
+        let mut settings = self
+            .inner
+            .settings
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        settings.on_finish = command.trim().to_string();
+        settings
+            .save(&self.inner.paths.settings)
+            .context("cannot save the settings")
+    }
+
+    pub fn rss(&self) -> Rss {
+        self.inner.feeds.get()
+    }
+
+    pub async fn rss_execute(&self, action: RssAction) -> Result<Rss> {
+        let feeds = &self.inner.feeds;
+        match action {
+            RssAction::AddFeed { url } => {
+                let id = feeds.add_feed(&url)?;
+                self.spawn_refresh(id);
+            }
+            RssAction::UpdateFeed { id, name, enabled } => feeds.update_feed(&id, name, enabled)?,
+            RssAction::RemoveFeed { id } => feeds.remove_feed(&id),
+            RssAction::Refresh { id } => {
+                for id in id.map(|id| vec![id]).unwrap_or_else(|| feeds.ids()) {
+                    self.spawn_refresh(id);
+                }
+            }
+            RssAction::SaveRule { rule } => {
+                feeds.save_rule(rule)?;
+            }
+            RssAction::RemoveRule { id } => feeds.remove_rule(&id),
+        }
+        self.tick().await;
+        Ok(feeds.get())
+    }
+
+    /// The feed items `rule` would take, for checking a rule before saving it.
+    pub fn rule_matches(&self, rule: &Rule) -> Result<Vec<RuleMatch>> {
+        self.inner.feeds.matches(rule)
+    }
+
+    fn spawn_refresh(&self, id: String) {
+        let core = self.clone();
+        tokio::spawn(async move { core.refresh_feed(&id).await });
+    }
+
+    async fn refresh_feed(&self, id: &str) {
+        let takes = self.inner.feeds.refresh(id).await;
+        for take in takes {
+            let request = AddRequest {
+                category: take.category,
+                save_path: take.save_path,
+                paused: take.paused.then_some(true),
+                ..AddRequest::link(take.link)
+            };
+            if let Err(err) = Box::pin(self.add(request)).await {
+                let error = format!("cannot add {}: {err:#}", take.title);
+                tracing::warn!("{error}");
+                self.inner.feeds.note_error(&take.feed, error);
+            }
+        }
+        self.tick().await;
+    }
+
+    /// Settings, categories, tags and RSS, leaving out the web password and API keys.
+    pub fn backup(&self) -> Backup {
+        let (categories, tags) = {
+            let store = lock(&self.inner.store);
+            (categories(&store), store.all_tags())
+        };
+        let rss = self.inner.feeds.get();
+        let feeds = rss
+            .feeds
+            .into_iter()
+            .map(|feed| Feed {
+                items: Vec::new(),
+                checked: None,
+                error: None,
+                ready: false,
+                ..feed
+            })
+            .collect();
+        Backup {
+            app: "bawkbit".into(),
+            version: crate::VERSION.into(),
+            settings: self.settings().public(),
+            categories,
+            tags,
+            feeds,
+            rules: rss.rules,
+        }
+    }
+
+    /// Takes a backup's settings and adds its categories, tags, feeds and rules to those here.
+    pub async fn restore(&self, backup: Backup) -> Result<()> {
+        if backup.app != "bawkbit" {
+            bail!("that file is not a bawkbit backup");
+        }
+        self.update_settings(backup.settings).await?;
+        self.edit_store(|store| {
+            for category in backup.categories {
+                let limits = (category.down_limit, category.up_limit);
+                if limits == (0, 0) {
+                    store.category_limits.remove(&category.name);
+                } else {
+                    store.category_limits.insert(category.name.clone(), limits);
+                }
+                store.categories.insert(category.name, category.save_path);
+            }
+            store.tags.extend(clean_tags(backup.tags));
+        });
+        self.inner.feeds.restore(backup.feeds, backup.rules);
+        self.tick().await;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> Arc<Snapshot> {
@@ -323,7 +507,11 @@ impl Core {
                             .delete(TorrentIdOrHash::Hash(hash), delete_files)
                             .await?;
                     }
-                    self.edit_store(|store| store.torrents.remove(&id));
+                    self.edit_store(|store| {
+                        store.torrents.remove(&id);
+                        store.waiting.remove(&id);
+                    });
+                    lock(&self.inner.live).downloading.remove(&id);
                 }
             }
             Action::SetFiles { id, files } => {
@@ -377,6 +565,7 @@ impl Core {
             }
             Action::RemoveCategory { name } => self.edit_store(|store| {
                 store.categories.remove(&name);
+                store.category_limits.remove(&name);
                 for entry in store.torrents.values_mut() {
                     if entry.category.as_deref() == Some(name.as_str()) {
                         entry.category = None;
@@ -389,6 +578,72 @@ impl Core {
                     entry.tags.retain(|existing| *existing != tag);
                 }
             }),
+            Action::RenameCategory { from, to } => {
+                let to = to.trim().to_string();
+                if to.is_empty() {
+                    bail!("name the category");
+                }
+                if to != from {
+                    self.edit_store(|store| {
+                        if store.categories.contains_key(&to) {
+                            bail!("there is already a category named {to}");
+                        }
+                        let path = store
+                            .categories
+                            .remove(&from)
+                            .ok_or_else(|| anyhow!("no category named {from}"))?;
+                        store.categories.insert(to.clone(), path);
+                        if let Some(limits) = store.category_limits.remove(&from) {
+                            store.category_limits.insert(to.clone(), limits);
+                        }
+                        for entry in store.torrents.values_mut() {
+                            if entry.category.as_deref() == Some(from.as_str()) {
+                                entry.category = Some(to.clone());
+                            }
+                        }
+                        for waiting in store.waiting.values_mut() {
+                            if waiting.request.category.as_deref() == Some(from.as_str()) {
+                                waiting.request.category = Some(to.clone());
+                            }
+                        }
+                        anyhow::Ok(())
+                    })?;
+                    for row in lock(&self.inner.pending).iter_mut() {
+                        if row.category.as_deref() == Some(from.as_str()) {
+                            row.category = Some(to.clone());
+                        }
+                    }
+                    self.inner.feeds.rename_category(&from, &to);
+                }
+            }
+            Action::RenameTag { from, to } => {
+                let to = to.trim().to_string();
+                if to.is_empty() {
+                    bail!("name the tag");
+                }
+                self.edit_store(|store| {
+                    store.tags.remove(&from);
+                    store.tags.insert(to.clone());
+                    for entry in store.torrents.values_mut() {
+                        if entry.tags.contains(&from) {
+                            entry.tags.retain(|tag| *tag != from && *tag != to);
+                            entry.tags.push(to.clone());
+                            entry.tags.sort();
+                        }
+                    }
+                });
+            }
+            Action::SetCategoryLimits { name, down, up } => self.edit_store(|store| {
+                if !store.categories.contains_key(&name) {
+                    bail!("no category named {name}");
+                }
+                if (down, up) == (0, 0) {
+                    store.category_limits.remove(&name);
+                } else {
+                    store.category_limits.insert(name, (down, up));
+                }
+                anyhow::Ok(())
+            })?,
             Action::SetAltSpeed { on } => {
                 let mut settings = self.settings();
                 settings.alt_speed = on;
@@ -503,7 +758,11 @@ impl Core {
                 .get(id)
                 .cloned()
                 .unwrap_or_default();
-            apply_entry(&handle, &entry);
+            let group = lock(&self.inner.live)
+                .groups
+                .get(entry.category.as_deref().unwrap_or_default())
+                .cloned();
+            apply_entry(&handle, &entry, group);
         }
         Ok(())
     }
@@ -617,7 +876,7 @@ impl Core {
             }
             if !lock(&self.inner.resolved).contains_key(&info.id) {
                 let id = info.id.clone();
-                self.add_in_background(info, request);
+                self.add_in_background(info, request, crate::now());
                 return Ok(id);
             }
         }
@@ -626,7 +885,7 @@ impl Core {
         Ok(id)
     }
 
-    fn add_in_background(&self, info: magnet::MagnetInfo, request: AddRequest) {
+    fn add_in_background(&self, info: magnet::MagnetInfo, request: AddRequest, added: i64) {
         {
             let mut pending = lock(&self.inner.pending);
             if pending.iter().any(|row| row.id == info.id) {
@@ -635,13 +894,18 @@ impl Core {
             pending.push(Pending {
                 id: info.id.clone(),
                 name: info.name.clone().unwrap_or_else(|| info.id.clone()),
-                added: crate::now(),
+                added,
                 save_path: self.save_path_for(&request),
                 category: request.category.clone(),
                 tags: request.tags.clone(),
                 error: None,
             });
         }
+        let waiting = Waiting {
+            added,
+            request: request.clone(),
+        };
+        self.edit_store(|store| store.waiting.insert(info.id.clone(), waiting));
         let core = self.clone();
         tokio::spawn(async move {
             let result = async {
@@ -653,6 +917,9 @@ impl Core {
                 anyhow::Ok(())
             }
             .await;
+            if result.is_ok() {
+                core.edit_store(|store| store.waiting.remove(&info.id));
+            }
             let mut pending = lock(&core.inner.pending);
             match result {
                 Ok(()) => pending.retain(|row| row.id != info.id),
@@ -709,6 +976,24 @@ impl Core {
         if only_files.as_ref().is_some_and(|files| files.is_empty()) {
             bail!("pick at least one file");
         }
+        if request.skip_check {
+            let pieces = librqbit::torrent_from_bytes(&resolved.bytes)
+                .map_err(|err| anyhow!("{err:#}"))?
+                .info
+                .data
+                .pieces
+                .as_ref()
+                .len()
+                / 20;
+            let path = self
+                .inner
+                .paths
+                .session
+                .join(format!("{:?}.bitv", id20(id)?));
+            std::fs::create_dir_all(&self.inner.paths.session).ok();
+            std::fs::write(&path, full_bitfield(pieces))
+                .with_context(|| format!("cannot write {path:?}"))?;
+        }
         let options = AddTorrentOptions {
             paused: paused || queued,
             output_folder: Some(output.to_string_lossy().into_owned()),
@@ -721,6 +1006,9 @@ impl Core {
             .add_torrent(AddTorrent::from_bytes(resolved.bytes), Some(options))
             .await
             .map_err(|err| anyhow!("{err:#}"))?;
+        if !request.skip_check {
+            lock(&self.inner.live).downloading.insert(id.to_string());
+        }
         let tags = clean_tags(request.tags.clone());
         self.edit_store(|store| {
             store.tags.extend(tags.iter().cloned());
@@ -900,7 +1188,14 @@ impl Core {
         }
         let handles = self.handles();
         let settings = self.settings();
-        let (mut torrents, ops) = self.read_torrents(&handles, &settings);
+        let (mut torrents, ops, finished) = self.read_torrents(&handles, &settings);
+        for done in finished {
+            run_on_finish(&settings.on_finish, &done);
+            let _ = self.inner.finished.send(Finished {
+                id: done.id,
+                name: done.name,
+            });
+        }
         for op in ops {
             let session = self.session();
             let result = match op {
@@ -928,15 +1223,7 @@ impl Core {
         let totals = self.totals(&settings);
         let (categories, tags) = {
             let store = lock(&self.inner.store);
-            let categories = store
-                .categories
-                .iter()
-                .map(|(name, path)| Category {
-                    name: name.clone(),
-                    save_path: path.clone(),
-                })
-                .collect();
-            (categories, store.all_tags())
+            (categories(&store), store.all_tags())
         };
         let history = {
             let mut live = lock(&self.inner.live);
@@ -955,20 +1242,42 @@ impl Core {
             categories,
             tags,
             history,
+            rss_rev: self.inner.feeds.rev(),
         }));
         if rev.is_multiple_of(10) {
             self.save_store();
         }
     }
 
-    fn read_torrents(&self, handles: &[Handle], settings: &Settings) -> (Vec<Torrent>, Vec<Op>) {
+    fn read_torrents(
+        &self,
+        handles: &[Handle],
+        settings: &Settings,
+    ) -> (Vec<Torrent>, Vec<Op>, Vec<Done>) {
         let now = crate::now();
         let mut store = lock(&self.inner.store);
         let mut live = lock(&self.inner.live);
         let mut dirty = false;
         let mut rows = Vec::with_capacity(handles.len());
         let mut ops = Vec::new();
+        let mut finished = Vec::new();
         let mut queue: Vec<(i64, usize)> = Vec::new();
+
+        let limited = &store.category_limits;
+        live.groups
+            .retain(|name, _| limited.get(name).is_some_and(|limits| *limits != (0, 0)));
+        for (name, (down, up)) in limited.iter().filter(|(_, limits)| **limits != (0, 0)) {
+            let group = live
+                .groups
+                .entry(name.clone())
+                .or_insert_with(|| Arc::new(Limits::new(LimitsConfig::default())));
+            if group.get_download_bps() != bps(*down) {
+                group.set_download_bps(bps(*down));
+            }
+            if group.get_upload_bps() != bps(*up) {
+                group.set_upload_bps(bps(*up));
+            }
+        }
 
         for handle in handles {
             let id = handle.info_hash().as_string();
@@ -977,7 +1286,12 @@ impl Core {
                 dirty = true;
             }
             let entry = store.entry(&id);
-            if apply_entry(handle, entry) && handle.live().is_some() {
+            let group = entry
+                .category
+                .as_ref()
+                .and_then(|name| live.groups.get(name))
+                .cloned();
+            if apply_entry(handle, entry, group) && handle.live().is_some() {
                 ops.push(Op::Reconnect(handle.clone()));
             }
 
@@ -1030,6 +1344,16 @@ impl Core {
             let remaining = size.saturating_sub(done);
             let eta = (down > 0 && !stats.finished).then(|| remaining / down.max(1));
             let ratio = entry.uploaded as f32 / done.max(1) as f32;
+
+            let checked = matches!(
+                stats.state,
+                TorrentStatsState::Live | TorrentStatsState::Paused
+            );
+            if checked && !stats.finished {
+                live.downloading.insert(id.clone());
+            } else if stats.finished && live.downloading.remove(&id) {
+                finished.push(done_info(handle, &id, entry, size));
+            }
 
             if state == State::Seeding
                 && !entry.keep_seeding
@@ -1106,7 +1430,7 @@ impl Core {
         if dirty {
             self.inner.store_dirty.store(true, Ordering::Relaxed);
         }
-        (rows, ops)
+        (rows, ops, finished)
     }
 
     fn apply_schedule_and_limits(&self, settings: &Settings) {
@@ -1164,6 +1488,7 @@ impl Core {
                 tags: Vec::new(),
                 paused: None,
                 files: None,
+                skip_check: false,
             };
             let mut done = path.clone().into_os_string();
             match Box::pin(self.add(request)).await {
@@ -1230,7 +1555,11 @@ async fn build_session(paths: &Paths, settings: &Settings) -> Result<Arc<Session
             }),
             peer_id: Some(peer_id()),
             listen: listen.then(|| ListenerOptions {
-                mode: ListenerMode::TcpOnly,
+                mode: if settings.utp {
+                    ListenerMode::TcpAndUtp
+                } else {
+                    ListenerMode::TcpOnly
+                },
                 listen_addr: (Ipv6Addr::UNSPECIFIED, settings.listen_port).into(),
                 enable_upnp_port_forwarding: settings.upnp,
                 ..Default::default()
@@ -1373,7 +1702,7 @@ fn pending_row(pending: &Pending) -> Torrent {
 }
 
 /// Puts bawkbit's choices for one torrent into the engine; true when its upload switch changed.
-fn apply_entry(handle: &Handle, entry: &Entry) -> bool {
+fn apply_entry(handle: &Handle, entry: &Entry, group: Option<Arc<Limits>>) -> bool {
     let limits = handle.ratelimits();
     if limits.get_download_bps() != bps(entry.down_limit) {
         limits.set_download_bps(bps(entry.down_limit));
@@ -1381,7 +1710,183 @@ fn apply_entry(handle: &Handle, entry: &Entry) -> bool {
     if limits.get_upload_bps() != bps(entry.up_limit) {
         limits.set_upload_bps(bps(entry.up_limit));
     }
+    let same = match (handle.group_ratelimits(), &group) {
+        (Some(current), Some(wanted)) => Arc::ptr_eq(&current, wanted),
+        (current, wanted) => current.is_none() && wanted.is_none(),
+    };
+    if !same {
+        handle.set_group_ratelimits(group);
+    }
     handle.set_upload_disabled(entry.no_upload)
+}
+
+fn categories(store: &Store) -> Vec<Category> {
+    store
+        .categories
+        .iter()
+        .map(|(name, path)| {
+            let (down_limit, up_limit) =
+                store.category_limits.get(name).copied().unwrap_or_default();
+            Category {
+                name: name.clone(),
+                save_path: path.clone(),
+                down_limit,
+                up_limit,
+            }
+        })
+        .collect()
+}
+
+/// A piece map that claims every piece, in the engine's on-disk layout: one bit a piece, first piece in the top bit.
+fn full_bitfield(pieces: usize) -> Vec<u8> {
+    let mut bytes = vec![0xff; pieces.div_ceil(8)];
+    if let Some(last) = bytes.last_mut()
+        && !pieces.is_multiple_of(8)
+    {
+        *last = 0xff << (8 - pieces % 8);
+    }
+    bytes
+}
+
+fn done_info(handle: &Handle, id: &str, entry: &Entry, size: u64) -> Done {
+    let output = handle.output_folder().to_path_buf();
+    let metadata = handle.metadata.load();
+    let files: Vec<PathBuf> = metadata
+        .as_ref()
+        .map(|meta| {
+            meta.info
+                .iter_file_details()
+                .map(|details| details.filename.to_pathbuf())
+                .collect()
+        })
+        .unwrap_or_default();
+    let (content, folder) = match files.as_slice() {
+        [only] => (output.join(only), output.clone()),
+        _ => (
+            output.clone(),
+            output.parent().map(Path::to_path_buf).unwrap_or(output),
+        ),
+    };
+    Done {
+        id: id.to_string(),
+        name: handle.name().unwrap_or_else(|| id.to_string()),
+        category: entry.category.clone(),
+        tags: entry.tags.clone(),
+        content,
+        folder,
+        size,
+        files: files.len(),
+    }
+}
+
+/// Runs the finish program without a shell, so a torrent name can never become a command.
+fn run_on_finish(command: &str, done: &Done) {
+    let words = split_command(command);
+    let Some((program, args)) = words.split_first() else {
+        return;
+    };
+    let tags = done.tags.join(",");
+    let category = done.category.clone().unwrap_or_default();
+    let values = [
+        ('N', done.name.clone()),
+        ('F', done.content.to_string_lossy().into_owned()),
+        ('D', done.folder.to_string_lossy().into_owned()),
+        ('L', category.clone()),
+        ('G', tags.clone()),
+        ('Z', done.size.to_string()),
+        ('C', done.files.to_string()),
+        ('I', done.id.clone()),
+    ];
+    let fill = |word: &str| fill_placeholders(word, &values);
+    let mut child = tokio::process::Command::new(fill(program));
+    child
+        .args(args.iter().map(|arg| fill(arg)))
+        .env("BAWKBIT_NAME", &done.name)
+        .env("BAWKBIT_CONTENT", &done.content)
+        .env("BAWKBIT_FOLDER", &done.folder)
+        .env("BAWKBIT_CATEGORY", category)
+        .env("BAWKBIT_TAGS", tags)
+        .env("BAWKBIT_SIZE", done.size.to_string())
+        .env("BAWKBIT_ID", &done.id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    child.creation_flags(0x0800_0000);
+    let program = program.clone();
+    match child.spawn() {
+        Ok(mut child) => {
+            tokio::spawn(async move {
+                match child.wait().await {
+                    Ok(status) if !status.success() => {
+                        tracing::warn!("the finish program {program} ended with {status}");
+                    }
+                    Err(err) => tracing::warn!("the finish program {program} failed: {err}"),
+                    Ok(_) => {}
+                }
+            });
+        }
+        Err(err) => tracing::warn!("cannot run the finish program {program}: {err}"),
+    }
+}
+
+/// Words split on spaces, with single or double quotes keeping spaces in; backslashes stay as typed for Windows paths.
+fn split_command(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for c in line.chars() {
+        match quote {
+            Some(open) if c == open => quote = None,
+            Some(_) => word.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                started = true;
+            }
+            None if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            None => {
+                word.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    words
+}
+
+/// qBittorrent's %N-style placeholders, so scripts written for it work here.
+fn fill_placeholders(word: &str, values: &[(char, String)]) -> String {
+    let mut out = String::with_capacity(word.len());
+    let mut chars = word.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            Some(key) => match values.iter().find(|(name, _)| *name == key) {
+                Some((_, value)) => {
+                    chars.next();
+                    out.push_str(value);
+                }
+                None => out.push('%'),
+            },
+            None => out.push('%'),
+        }
+    }
+    out
 }
 
 /// Trimmed, without repeats, each an http, https or udp address.
@@ -1650,6 +2155,301 @@ mod tests {
         assert!(row.no_upload);
         assert_eq!((row.down_limit, row.up_limit), (5000, 7000));
         core.shutdown().await;
+    }
+
+    async fn shared_file(root: &Path, name: &str) -> (PathBuf, Vec<u8>) {
+        let folder = root.join(format!("{name}-data"));
+        std::fs::create_dir_all(&folder).unwrap();
+        let seed = name.len() as u32;
+        let data: Vec<u8> = (0..3 * 65536u32)
+            .map(|n| ((n + seed) * 7 % 251) as u8)
+            .collect();
+        let file = folder.join(format!("{name}.bin"));
+        std::fs::write(&file, &data).unwrap();
+        let options = librqbit::CreateTorrentOptions {
+            name: None,
+            trackers: Vec::new(),
+            piece_length: Some(65536),
+        };
+        let spawner = librqbit::spawn_utils::BlockingSpawner::new(1);
+        let created = librqbit::create_torrent(&file, options, &spawner)
+            .await
+            .unwrap();
+        (folder, created.as_bytes().unwrap().to_vec())
+    }
+
+    async fn start_core(home: &Path, downloads: &Path, tweak: impl FnOnce(&mut Settings)) -> Core {
+        std::fs::create_dir_all(home).unwrap();
+        let mut settings = Settings {
+            download_dir: downloads.to_string_lossy().into_owned(),
+            dht: false,
+            upnp: false,
+            listen_port: 0,
+            ..Settings::default()
+        };
+        tweak(&mut settings);
+        settings.save(&home.join("settings.json")).unwrap();
+        Core::start(home.to_path_buf()).await.unwrap()
+    }
+
+    async fn add_file(core: &Core, bytes: Vec<u8>, save: &Path, skip_check: bool) -> Id {
+        let preview = core.preview(Source::File(bytes)).await.unwrap();
+        let mut request = AddRequest::link("");
+        request.source = Source::Resolved(preview.id);
+        request.save_path = Some(save.to_string_lossy().into_owned());
+        request.skip_check = skip_check;
+        core.add(request).await.unwrap()
+    }
+
+    async fn wait_until(core: &Core, id: &str, what: &str, check: impl Fn(&Torrent) -> bool) {
+        let row = || {
+            core.snapshot()
+                .torrents
+                .iter()
+                .find(|t| t.id == id)
+                .cloned()
+        };
+        for _ in 0..300 {
+            if row().is_some_and(|t| check(&t)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("no {what}: {:?}", row());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_download_runs_the_finish_program_and_tells_subscribers() {
+        let root = tempfile::tempdir().unwrap();
+        let (seed_dir, bytes) = shared_file(root.path(), "data").await;
+        let seeder = start_core(&root.path().join("seeder"), &seed_dir, |_| {}).await;
+        let id = add_file(&seeder, bytes.clone(), &seed_dir, false).await;
+        wait_until(&seeder, &id, "seeding", |t| t.state == State::Seeding).await;
+        let port = seeder.snapshot().totals.port.expect("the seeder listens");
+
+        let out = root.path().join("finished.txt");
+        let command = if cfg!(windows) {
+            format!("cmd /C echo %N %Z>{}", out.display())
+        } else {
+            format!("sh -c 'echo %N %Z > \"{}\"'", out.display())
+        };
+        let downloads = root.path().join("leech");
+        let leecher = start_core(&root.path().join("leecher"), &downloads, |settings| {
+            settings.on_finish = command;
+        })
+        .await;
+        let mut finished = leecher.subscribe_finished();
+        let preview = leecher.preview(Source::File(bytes)).await.unwrap();
+        if let Some(resolved) = lock(&leecher.inner.resolved).get_mut(&preview.id) {
+            resolved.peers = vec![SocketAddr::from(([127, 0, 0, 1], port))];
+        }
+        let mut request = AddRequest::link("");
+        request.source = Source::Resolved(preview.id);
+        leecher.add(request).await.unwrap();
+
+        let wait = Duration::from_secs(60);
+        let done = tokio::time::timeout(wait, finished.recv())
+            .await
+            .expect("the download finishes")
+            .unwrap();
+        assert_eq!(done.id, id);
+        assert_eq!(done.name, "data.bin");
+        assert!(downloads.join("data.bin").exists());
+        let mut written = String::new();
+        for _ in 0..100 {
+            written = std::fs::read_to_string(&out).unwrap_or_default();
+            if !written.trim().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(written.trim(), "data.bin 196608");
+        leecher.shutdown().await;
+        seeder.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn skipping_the_check_trusts_complete_files_and_still_catches_missing_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let (complete_dir, complete) = shared_file(root.path(), "complete").await;
+        let (missing_dir, missing) = shared_file(root.path(), "missing").await;
+        std::fs::remove_dir_all(&missing_dir).unwrap();
+        let core = start_core(&root.path().join("home"), root.path(), |_| {}).await;
+        let mut finished = core.subscribe_finished();
+
+        let trusted = add_file(&core, complete, &complete_dir, true).await;
+        wait_until(&core, &trusted, "seeding", |t| t.state == State::Seeding).await;
+        let wrong = add_file(&core, missing, &missing_dir, true).await;
+        wait_until(&core, &wrong, "a download", |t| {
+            matches!(t.state, State::Stalled | State::Downloading)
+        })
+        .await;
+        let row = core
+            .snapshot()
+            .torrents
+            .iter()
+            .find(|t| t.id == wrong)
+            .cloned();
+        assert_eq!(row.unwrap().done, 0);
+        assert!(finished.try_recv().is_err(), "nothing was downloaded");
+        core.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_magnet_still_fetching_its_files_comes_back_after_a_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let core = start_core(&home, root.path(), |_| {}).await;
+        let link = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=waiting";
+        let mut request = AddRequest::link(link);
+        request.category = Some("tv".into());
+        let id = core.add(request).await.unwrap();
+        let waiting = |t: &Torrent| {
+            t.name == "waiting"
+                && t.category.as_deref() == Some("tv")
+                && matches!(t.state, State::Metadata | State::Error)
+        };
+        wait_until(&core, &id, "a row for the magnet", waiting).await;
+        core.shutdown().await;
+        drop(core);
+
+        let core = Core::start(home.clone()).await.unwrap();
+        wait_until(&core, &id, "the row after a restart", waiting).await;
+        let remove = Action::Remove {
+            ids: vec![id.clone()],
+            delete_files: false,
+        };
+        core.execute(remove).await.unwrap();
+        core.shutdown().await;
+        drop(core);
+
+        let core = Core::start(home).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(core.snapshot().torrents.iter().all(|t| t.id != id));
+        core.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn category_limits_follow_renames_and_backups_carry_categories_tags_and_rss() {
+        let root = tempfile::tempdir().unwrap();
+        let (folder, bytes) = shared_file(root.path(), "data").await;
+        let core = start_core(&root.path().join("home"), &folder, |_| {}).await;
+        let id = add_file(&core, bytes, &folder, false).await;
+        let ids = vec![id.clone()];
+        let run = |action: Action| {
+            let core = core.clone();
+            async move { core.execute(action).await.unwrap() }
+        };
+        run(Action::SetCategory {
+            ids: ids.clone(),
+            category: Some("iso".into()),
+        })
+        .await;
+        run(Action::SetCategoryLimits {
+            name: "iso".into(),
+            down: 5000,
+            up: 7000,
+        })
+        .await;
+        let group = core.handle(&id).unwrap().group_ratelimits();
+        assert_eq!(group.unwrap().get_upload_bps().unwrap().get(), 7000);
+
+        run(Action::RenameCategory {
+            from: "iso".into(),
+            to: "linux".into(),
+        })
+        .await;
+        run(Action::AddTags {
+            ids: ids.clone(),
+            tags: vec!["old".into(), "keep".into()],
+        })
+        .await;
+        run(Action::RenameTag {
+            from: "old".into(),
+            to: "new".into(),
+        })
+        .await;
+        let snapshot = core.snapshot();
+        let linux = Category {
+            name: "linux".into(),
+            save_path: String::new(),
+            down_limit: 5000,
+            up_limit: 7000,
+        };
+        assert_eq!(snapshot.categories, std::slice::from_ref(&linux));
+        assert_eq!(snapshot.torrents[0].category.as_deref(), Some("linux"));
+        assert_eq!(snapshot.torrents[0].tags, ["keep", "new"]);
+        let group = core.handle(&id).unwrap().group_ratelimits();
+        assert_eq!(group.unwrap().get_download_bps().unwrap().get(), 5000);
+        let renamed = core
+            .execute(Action::RenameCategory {
+                from: "linux".into(),
+                to: "linux".into(),
+            })
+            .await;
+        assert!(renamed.is_ok());
+
+        let rule = Rule {
+            name: "shows".into(),
+            must_contain: "show 1080p".into(),
+            category: Some("linux".into()),
+            ..Rule::default()
+        };
+        core.rss_execute(RssAction::SaveRule { rule })
+            .await
+            .unwrap();
+        core.rss_execute(RssAction::AddFeed {
+            url: "http://127.0.0.1:9/feed".into(),
+        })
+        .await
+        .unwrap();
+        let backup = core.backup();
+        assert!(backup.settings.web.password_hash.is_empty());
+
+        let other = start_core(&root.path().join("other"), root.path(), |_| {}).await;
+        let mut wrong = backup.clone();
+        wrong.app = "something else".into();
+        assert!(other.restore(wrong).await.is_err());
+        other.restore(backup).await.unwrap();
+        assert_eq!(other.snapshot().categories, [linux]);
+        assert!(other.snapshot().tags.contains(&"new".to_string()));
+        let rss = other.rss();
+        assert_eq!(rss.rules[0].name, "shows");
+        assert_eq!(rss.feeds[0].url, "http://127.0.0.1:9/feed");
+        assert_eq!(other.settings().download_dir, core.settings().download_dir);
+
+        run(Action::SetCategoryLimits {
+            name: "linux".into(),
+            down: 0,
+            up: 0,
+        })
+        .await;
+        assert!(core.handle(&id).unwrap().group_ratelimits().is_none());
+        other.shutdown().await;
+        core.shutdown().await;
+    }
+
+    #[test]
+    fn finish_commands_split_like_a_shell_and_fill_placeholders() {
+        assert_eq!(
+            split_command(r#"C:\scripts\done.bat "%F" --tag '%G'  "#),
+            [r"C:\scripts\done.bat", "%F", "--tag", "%G"]
+        );
+        assert_eq!(split_command(r#"say "a b"c"#), ["say", "a bc"]);
+        assert_eq!(split_command(r#"x """#), ["x", ""]);
+        assert!(split_command("   ").is_empty());
+        let values = [('N', "My; Show".to_string()), ('Z', "42".to_string())];
+        assert_eq!(
+            fill_placeholders("%N (%Z) 100%% %Q %", &values),
+            "My; Show (42) 100% %Q %"
+        );
+    }
+
+    #[test]
+    fn a_full_bitfield_sets_one_bit_per_piece_from_the_top() {
+        assert_eq!(full_bitfield(8), [0xff]);
+        assert_eq!(full_bitfield(10), [0xff, 0b1100_0000]);
+        assert_eq!(full_bitfield(1), [0b1000_0000]);
     }
 
     #[test]

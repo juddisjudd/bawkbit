@@ -15,7 +15,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use bawkbit_core::settings::{Indexer, Settings};
 use bawkbit_core::{
-    Action, AddRequest, Core, Details, Preview, Reply, SearchReply, SearchRequest, Snapshot, Source,
+    Action, AddRequest, Backup, Core, Details, Preview, Reply, Rss, RssAction, Rule, RuleMatch,
+    SearchReply, SearchRequest, Snapshot, Source,
 };
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
@@ -157,6 +158,9 @@ fn router(state: AppState) -> Router {
         .route("/settings", get(get_settings).put(put_settings))
         .route("/search", post(search))
         .route("/indexers/test", post(test_indexer))
+        .route("/rss", get(get_rss).post(rss_action))
+        .route("/rss/matches", post(rule_matches))
+        .route("/backup", get(get_backup).post(restore))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_login));
     let open = Router::new()
         .route("/session", get(session))
@@ -316,27 +320,45 @@ async fn snapshot(State(state): State<AppState>) -> Json<Arc<Snapshot>> {
     Json(state.core.snapshot())
 }
 
-/// One `snapshot` event a second, for as long as the page is open.
+/// One `snapshot` event a second, and a `finished` event each time a torrent finishes, for as long as the page is open.
 async fn events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let updates = state.core.subscribe();
+    let finished = state.core.subscribe_finished();
     let stop = state.stop.clone();
     let stream = futures_util::stream::unfold(
-        (updates, stop, true),
-        |(mut updates, mut stop, first)| async move {
-            if !first {
-                tokio::select! {
-                    changed = updates.changed() => changed.ok()?,
-                    _ = stop.wait_for(|stop| *stop) => return None,
+        (updates, finished, stop, true),
+        |(mut updates, mut finished, mut stop, first)| async move {
+            let event = if first {
+                None
+            } else {
+                loop {
+                    tokio::select! {
+                        changed = updates.changed() => {
+                            changed.ok()?;
+                            break None;
+                        }
+                        done = finished.recv() => match done {
+                            Ok(done) => break Event::default().event("finished").json_data(&done).ok(),
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                        },
+                        _ = stop.wait_for(|stop| *stop) => return None,
+                    }
                 }
-            }
-            let snapshot = updates.borrow_and_update().clone();
-            let event = Event::default()
-                .event("snapshot")
-                .json_data(&*snapshot)
-                .ok()?;
-            Some((Ok(event), (updates, stop, false)))
+            };
+            let event = match event {
+                Some(event) => event,
+                None => {
+                    let snapshot = updates.borrow_and_update().clone();
+                    Event::default()
+                        .event("snapshot")
+                        .json_data(&*snapshot)
+                        .ok()?
+                }
+            };
+            Some((Ok(event), (updates, finished, stop, false)))
         },
     );
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -386,6 +408,33 @@ async fn test_indexer(
 ) -> ApiResult<Tested> {
     let message = state.core.test_indexer(indexer).await?;
     Ok(Json(Tested { message }))
+}
+
+async fn get_rss(State(state): State<AppState>) -> Json<Rss> {
+    Json(state.core.rss())
+}
+
+async fn rss_action(
+    State(state): State<AppState>,
+    Json(action): Json<RssAction>,
+) -> ApiResult<Rss> {
+    Ok(Json(state.core.rss_execute(action).await?))
+}
+
+async fn rule_matches(
+    State(state): State<AppState>,
+    Json(rule): Json<Rule>,
+) -> ApiResult<Vec<RuleMatch>> {
+    Ok(Json(state.core.rule_matches(&rule)?))
+}
+
+async fn get_backup(State(state): State<AppState>) -> Json<Backup> {
+    Json(state.core.backup())
+}
+
+async fn restore(State(state): State<AppState>, Json(backup): Json<Backup>) -> ApiResult<Reply> {
+    state.core.restore(backup).await?;
+    Ok(Json(Reply::Done))
 }
 
 async fn get_settings(State(state): State<AppState>) -> Json<Settings> {

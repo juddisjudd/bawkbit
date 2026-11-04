@@ -713,7 +713,12 @@ fn row_menu(
                 .icon(Icon::new(IconName::Gauge))
                 .on_click(move |_, window, cx| {
                     let (engine, ids) = (limit_engine.clone(), limit_ids.clone());
-                    prompts::speed_limits(engine, ids, shared_limits, window, cx)
+                    let action = move |down, up| Action::SetLimits {
+                        ids: ids.clone(),
+                        down,
+                        up,
+                    };
+                    prompts::speed_limits(engine, shared_limits, action, window, cx)
                 }),
         );
     if let Some(torrent) = &single {

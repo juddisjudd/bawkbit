@@ -34,6 +34,7 @@ pub struct AddView {
     tags: Vec<String>,
     files: Vec<bool>,
     start: bool,
+    skip_check: bool,
     busy: bool,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -87,6 +88,7 @@ impl AddView {
             tags: Vec::new(),
             files: Vec::new(),
             start,
+            skip_check: false,
             busy: false,
             error: None,
             _subscriptions: subscriptions,
@@ -242,6 +244,7 @@ impl AddView {
             tags,
             paused: Some(!self.start),
             files: (files.len() < self.files.len()).then_some(files),
+            skip_check: self.skip_check,
         };
         self.busy = true;
         self.error = None;
@@ -570,6 +573,15 @@ impl Render for AddView {
                                 .label("start now")
                                 .on_click(cx.listener(|this, checked: &bool, _, cx| {
                                     this.start = *checked;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Switch::new("skip-check")
+                                .checked(self.skip_check)
+                                .label("skip check")
+                                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                    this.skip_check = *checked;
                                     cx.notify();
                                 })),
                         )

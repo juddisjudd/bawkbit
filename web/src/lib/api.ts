@@ -56,6 +56,9 @@ export interface Totals {
 export interface Category {
   name: string
   save_path: string
+  /** Bytes per second shared by every torrent in it; 0 means no limit. */
+  down_limit: number
+  up_limit: number
 }
 
 export interface Snapshot {
@@ -65,6 +68,14 @@ export interface Snapshot {
   categories: Category[]
   tags: string[]
   history: [number, number][]
+  /** Changes whenever the RSS feeds or rules do. */
+  rss_rev: number
+}
+
+/** A torrent that finished downloading, sent as a `finished` event. */
+export interface Finished {
+  id: Id
+  name: string
 }
 
 export interface TorrentFile {
@@ -126,6 +137,8 @@ export interface AddRequest {
   tags?: string[]
   paused?: boolean | null
   files?: number[] | null
+  /** Trusts that the files are complete, so only a spot check runs. */
+  skip_check?: boolean
 }
 
 export type Action =
@@ -147,6 +160,9 @@ export type Action =
   | { action: 'set_trackers'; id: Id; trackers: string[] }
   | { action: 'set_no_upload'; ids: Id[]; on: boolean }
   | { action: 'set_limits'; ids: Id[]; down: number; up: number }
+  | { action: 'rename_category'; from: string; to: string }
+  | { action: 'rename_tag'; from: string; to: string }
+  | { action: 'set_category_limits'; name: string; down: number; up: number }
 
 export type Reply =
   | { kind: 'done' }
@@ -189,6 +205,11 @@ export interface Settings {
   ratio_limit: number
   seed_minutes: number
   watch_dir: string
+  utp: boolean
+  /** Read only here: the server ignores changes from clients. */
+  on_finish: string
+  /** Minutes between feed checks; 0 checks only by hand. */
+  rss_minutes: number
   web: Web
   indexers: Indexer[]
 }
@@ -237,6 +258,99 @@ export interface SearchFailure {
 export interface SearchReply {
   results: SearchResult[]
   failures: SearchFailure[]
+}
+
+export interface FeedItem {
+  id: string
+  title: string
+  /** A magnet link or a link to the .torrent file; empty when the feed gave neither. */
+  link: string
+  page: string | null
+  published: number | null
+  size: number | null
+  /** The name of the rule that added it. */
+  rule: string | null
+}
+
+export interface Feed {
+  id: string
+  url: string
+  /** A name given by hand; empty shows `title`. */
+  name: string
+  title: string
+  enabled: boolean
+  /** Newest first. */
+  items: FeedItem[]
+  checked: number | null
+  error: string | null
+  ready: boolean
+}
+
+export interface Rule {
+  id: string
+  name: string
+  enabled: boolean
+  must_contain: string
+  must_not_contain: string
+  regex: boolean
+  smart_episodes: boolean
+  /** Feed ids it watches; empty watches every feed. */
+  feeds: string[]
+  category: string | null
+  save_path: string | null
+  paused: boolean
+  episodes: string[]
+  last_match: number | null
+}
+
+export interface Rss {
+  feeds: Feed[]
+  rules: Rule[]
+}
+
+export type RssAction =
+  | { action: 'add_feed'; url: string }
+  | { action: 'update_feed'; id: string; name: string; enabled: boolean }
+  | { action: 'remove_feed'; id: string }
+  | { action: 'refresh'; id?: string | null }
+  | { action: 'save_rule'; rule: Rule }
+  | { action: 'remove_rule'; id: string }
+
+export interface RuleMatch {
+  feed: string
+  item: FeedItem
+}
+
+export interface Backup {
+  app: string
+  version: string
+  settings: Settings
+  categories: Category[]
+  tags: string[]
+  feeds: Feed[]
+  rules: Rule[]
+}
+
+export function feedLabel(feed: Feed): string {
+  return [feed.name, feed.title, feed.url].map((text) => text.trim()).find(Boolean) ?? ''
+}
+
+export function newRule(): Rule {
+  return {
+    id: '',
+    name: '',
+    enabled: true,
+    must_contain: '',
+    must_not_contain: '',
+    regex: false,
+    smart_episodes: false,
+    feeds: [],
+    category: null,
+    save_path: null,
+    paused: false,
+    episodes: [],
+    last_match: null
+  }
 }
 
 export interface SessionInfo {
@@ -302,7 +416,12 @@ export const api = {
   settings: () => request<Settings>('GET', '/settings'),
   saveSettings: (settings: Settings) => request<Settings>('PUT', '/settings', settings),
   search: (body: SearchRequest) => request<SearchReply>('POST', '/search', body),
-  testIndexer: (indexer: Indexer) => request<{ message: string }>('POST', '/indexers/test', indexer)
+  testIndexer: (indexer: Indexer) => request<{ message: string }>('POST', '/indexers/test', indexer),
+  rss: () => request<Rss>('GET', '/rss'),
+  rssAct: (action: RssAction) => request<Rss>('POST', '/rss', action),
+  ruleMatches: (rule: Rule) => request<RuleMatch[]>('POST', '/rss/matches', rule),
+  backup: () => request<Backup>('GET', '/backup'),
+  restore: (backup: unknown) => request<Reply>('POST', '/backup', backup)
 }
 
 export function fileToBase64(file: Blob): Promise<string> {

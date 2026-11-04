@@ -7,7 +7,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::filter::Status;
-use super::{Page, Workspace, act, kit};
+use super::{Page, Workspace, act, kit, prompts};
 use crate::assets::MARK;
 use crate::engine::Engine;
 use crate::format;
@@ -246,7 +246,8 @@ impl Workspace {
                     .filter(|t| t.category.as_ref() == Some(&name))
                     .count();
                 let active = on_torrents && filters.category.as_ref() == Some(&name);
-                let (click, remove) = (name.clone(), name.clone());
+                let (click, menu_name) = (name.clone(), name.clone());
+                let limits = (category.down_limit, category.up_limit);
                 let engine = self.engine.clone();
                 item(
                     format!("category-{name}").into(),
@@ -255,17 +256,53 @@ impl Workspace {
                     count,
                     active,
                 )
+                .when(limits != (0, 0), |this| {
+                    this.child(Icon::new(IconName::Gauge).xsmall().text_color(p.icon))
+                })
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.toggle_category(click.clone(), window, cx)
                 }))
                 .context_menu(move |menu, _, _| {
-                    let (engine, name) = (engine.clone(), remove.clone());
+                    let name = menu_name.clone();
+                    let (rename_engine, rename_name) = (engine.clone(), name.clone());
+                    let (limit_engine, limit_name) = (engine.clone(), name.clone());
+                    let (remove_engine, remove_name) = (engine.clone(), name.clone());
                     menu.item(
+                        PopupMenuItem::new("rename")
+                            .icon(Icon::new(IconName::Pencil))
+                            .on_click(move |_, window, cx| {
+                                let from = rename_name.clone();
+                                let action = move |to| Action::RenameCategory {
+                                    from: from.clone(),
+                                    to,
+                                };
+                                let current = rename_name.clone();
+                                prompts::rename(rename_engine.clone(), current, action, window, cx)
+                            }),
+                    )
+                    .item(
+                        PopupMenuItem::new("speed limits")
+                            .icon(Icon::new(IconName::Gauge))
+                            .on_click(move |_, window, cx| {
+                                let name = limit_name.clone();
+                                let action = move |down, up| Action::SetCategoryLimits {
+                                    name: name.clone(),
+                                    down,
+                                    up,
+                                };
+                                let engine = limit_engine.clone();
+                                prompts::speed_limits(engine, Some(limits), action, window, cx)
+                            }),
+                    )
+                    .separator()
+                    .item(
                         PopupMenuItem::new("remove category")
                             .icon(Icon::new(IconName::Trash))
                             .on_click(move |_, window, cx| {
-                                let action = Action::RemoveCategory { name: name.clone() };
-                                run_action(&engine, action, window, cx);
+                                let action = Action::RemoveCategory {
+                                    name: remove_name.clone(),
+                                };
+                                run_action(&remove_engine, action, window, cx);
                             }),
                     )
                 })
@@ -297,7 +334,22 @@ impl Workspace {
                 }))
                 .context_menu(move |menu, _, _| {
                     let (engine, tag) = (engine.clone(), remove.clone());
+                    let (rename_engine, rename_tag) = (engine.clone(), tag.clone());
                     menu.item(
+                        PopupMenuItem::new("rename")
+                            .icon(Icon::new(IconName::Pencil))
+                            .on_click(move |_, window, cx| {
+                                let from = rename_tag.clone();
+                                let action = move |to| Action::RenameTag {
+                                    from: from.clone(),
+                                    to,
+                                };
+                                let current = rename_tag.clone();
+                                prompts::rename(rename_engine.clone(), current, action, window, cx)
+                            }),
+                    )
+                    .separator()
+                    .item(
                         PopupMenuItem::new("remove tag")
                             .icon(Icon::new(IconName::Trash))
                             .on_click(move |_, window, cx| {
@@ -314,6 +366,7 @@ impl Workspace {
             .collect();
 
         let search_active = self.page == Page::Search;
+        let rss_active = self.page == Page::Rss;
         let settings_active = self.page == Page::Settings;
         let update = self.updates.read(cx).has_news();
         let has_categories = !categories.is_empty();
@@ -350,6 +403,11 @@ impl Workspace {
                             cx.listener(|this, _, window, cx| {
                                 this.select(Page::Search, window, cx)
                             }),
+                        ),
+                    )
+                    .child(
+                        item("rss".into(), IconName::Rss, "rss".into(), 0, rss_active).on_click(
+                            cx.listener(|this, _, window, cx| this.select(Page::Rss, window, cx)),
                         ),
                     )
                     .child(divider())

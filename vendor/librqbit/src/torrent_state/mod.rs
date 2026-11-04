@@ -181,6 +181,8 @@ pub struct ManagedTorrentShared {
     pub(crate) options: ManagedTorrentOptions,
     /// Kept here rather than in the live state, so a change outlives pausing.
     pub(crate) ratelimits: Arc<Limits>,
+    /// Limits shared with other torrents, applied on top of `ratelimits`.
+    pub(crate) group_ratelimits: ArcSwapOption<Limits>,
     pub(crate) connector: Arc<StreamConnector>,
     pub(crate) storage_factory: BoxStorageFactory,
     pub(crate) session: Weak<Session>,
@@ -226,7 +228,6 @@ impl ManagedTorrent {
         &self.shared
     }
 
-    /// The resolved on-disk folder this torrent's files are written under.
     pub fn upload_disabled(&self) -> bool {
         self.shared.options.disable_upload()
     }
@@ -244,6 +245,16 @@ impl ManagedTorrent {
         &self.shared.ratelimits
     }
 
+    pub fn group_ratelimits(&self) -> Option<Arc<Limits>> {
+        self.shared.group_ratelimits.load_full()
+    }
+
+    /// Takes effect from the next request; `None` leaves only this torrent's own limits.
+    pub fn set_group_ratelimits(&self, limits: Option<Arc<Limits>>) {
+        self.shared.group_ratelimits.store(limits);
+    }
+
+    /// The resolved on-disk folder this torrent's files are written under.
     pub fn output_folder(&self) -> &Path {
         &self.shared.options.output_folder
     }

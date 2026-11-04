@@ -8,8 +8,10 @@
 
   function submit(event: SubmitEvent): void {
     event.preventDefault()
+    const run = prompt.run
+    // the prop follows app.prompt, so it reads null once that is cleared
     app.prompt = null
-    prompt.run(value)
+    run(value)
   }
 
   function focus(node: HTMLInputElement): void {

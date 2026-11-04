@@ -21,6 +21,7 @@
   let category = $state('')
   let tags = $state('')
   let start = $state(!app.defaults?.start_paused)
+  let skipCheck = $state(false)
   let fileInput = $state<HTMLInputElement>()
   let over = $state(false)
   let attempt = 0
@@ -124,7 +125,8 @@
         category: category.trim() || null,
         tags: tags.split(',').map((t) => t.trim()).filter(Boolean),
         paused: !start,
-        files: chosen.size === preview.files.length ? null : [...chosen].sort((a, b) => a - b)
+        files: chosen.size === preview.files.length ? null : [...chosen].sort((a, b) => a - b),
+        skip_check: skipCheck
       })
       app.click(id, { ctrlKey: false, metaKey: false, shiftKey: false })
       close()
@@ -292,9 +294,20 @@
             {#each categories as c (c.name)}<option value={c.name}></option>{/each}
           </datalist>
 
+          {#if skipCheck}
+            <p class="muted small">the files must already be complete in the folder. a spot check still runs.</p>
+          {/if}
           <p class="error" role="alert">{error}</p>
           <div class="row">
             <button type="button" class="check toggle" role="checkbox" aria-checked={start} onclick={() => (start = !start)}>[{start ? 'x' : ' '}] start now</button>
+            <button
+              type="button"
+              class="check toggle"
+              role="checkbox"
+              aria-checked={skipCheck}
+              title="the files are already complete; a spot check still runs"
+              onclick={() => (skipCheck = !skipCheck)}>[{skipCheck ? 'x' : ' '}] skip check</button
+            >
             <span class="grow"></span>
             <button type="button" class="btn ghost" onclick={close}>cancel</button>
             <button type="submit" class="btn strong" disabled={busy || chosen.size === 0} {@attach focus}>add</button>

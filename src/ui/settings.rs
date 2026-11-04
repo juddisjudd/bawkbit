@@ -1,19 +1,20 @@
 use std::collections::HashMap;
 
-use bawkbit_core::Settings;
 use bawkbit_core::settings::{Indexer, IndexerKind};
+use bawkbit_core::{Backup, Settings};
 use bawkbit_web::Status as WebStatus;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Icon, Sizable, WindowExt};
+use gpui_kit::component::{Disableable, Icon, Sizable, WindowExt};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::kit;
 use super::updates::{UpdateState, Updates};
+use crate::autostart;
 use crate::config::Config;
 use crate::engine::Engine;
 use crate::format;
@@ -27,18 +28,20 @@ enum Tab {
     Queue,
     Search,
     Web,
+    App,
     Appearance,
     About,
 }
 
 impl Tab {
-    const ALL: [Tab; 8] = [
+    const ALL: [Tab; 9] = [
         Tab::Downloads,
         Tab::Connection,
         Tab::Speed,
         Tab::Queue,
         Tab::Search,
         Tab::Web,
+        Tab::App,
         Tab::Appearance,
         Tab::About,
     ];
@@ -51,6 +54,7 @@ impl Tab {
             Tab::Queue => "queue",
             Tab::Search => "search",
             Tab::Web => "web ui",
+            Tab::App => "app",
             Tab::Appearance => "appearance",
             Tab::About => "about",
         }
@@ -64,6 +68,7 @@ impl Tab {
             Tab::Queue => IconName::Hourglass,
             Tab::Search => IconName::Search,
             Tab::Web => IconName::Globe,
+            Tab::App => IconName::AppWindow,
             Tab::Appearance => IconName::Palette,
             Tab::About => IconName::Info,
         }
@@ -88,6 +93,8 @@ enum Field {
     WebAddress,
     WebPort,
     WebUser,
+    OnFinish,
+    RssMinutes,
 }
 
 pub enum SettingsEvent {
@@ -103,6 +110,7 @@ pub struct SettingsView {
     theme: SharedString,
     mode: Mode,
     quick_add: bool,
+    start_at_login: bool,
     inputs: HashMap<Field, Entity<InputState>>,
     errors: HashMap<Field, &'static str>,
     password: Entity<InputState>,
@@ -134,47 +142,10 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> Self {
         let s = engine.read(cx).core().settings();
-        let values = [
-            (Field::DownloadDir, s.download_dir.clone(), ""),
-            (Field::WatchDir, s.watch_dir.clone(), "off"),
-            (Field::Port, s.listen_port.to_string(), ""),
-            (Field::PeerLimit, nonzero(s.peer_limit), "engine default"),
-            (
-                Field::DownLimit,
-                format::rate_input(s.down_limit),
-                "no limit",
-            ),
-            (Field::UpLimit, format::rate_input(s.up_limit), "no limit"),
-            (
-                Field::AltDown,
-                format::rate_input(s.alt_down_limit),
-                "no limit",
-            ),
-            (Field::AltUp, format::rate_input(s.alt_up_limit), "no limit"),
-            (Field::From, format::clock(s.schedule.from), "08:00"),
-            (Field::To, format::clock(s.schedule.to), "20:00"),
-            (
-                Field::MaxActive,
-                nonzero(s.max_active_downloads),
-                "no limit",
-            ),
-            (
-                Field::Ratio,
-                if s.ratio_limit > 0.0 {
-                    s.ratio_limit.to_string()
-                } else {
-                    String::new()
-                },
-                "seed forever",
-            ),
-            (Field::SeedMinutes, nonzero(s.seed_minutes), "seed forever"),
-            (Field::WebAddress, s.web.address.clone(), "0.0.0.0"),
-            (Field::WebPort, s.web.port.to_string(), ""),
-            (Field::WebUser, s.web.username.clone(), "admin"),
-        ];
         let mut inputs = HashMap::new();
         let mut subscriptions = Vec::new();
-        for (field, value, placeholder) in values {
+        for (field, value) in field_values(&s) {
+            let placeholder = placeholder(field);
             let input = cx.new(|cx| {
                 InputState::new(window, cx)
                     .placeholder(placeholder)
@@ -205,6 +176,7 @@ impl SettingsView {
             theme: config.theme.clone().into(),
             mode: config.mode,
             quick_add: config.quick_add,
+            start_at_login: autostart::enabled(),
             inputs,
             errors: HashMap::new(),
             password,
@@ -220,6 +192,11 @@ impl SettingsView {
 
     pub fn show_search(&mut self, cx: &mut Context<Self>) {
         self.tab = Tab::Search;
+        cx.notify();
+    }
+
+    pub fn show_about(&mut self, cx: &mut Context<Self>) {
+        self.tab = Tab::About;
         cx.notify();
     }
 
@@ -345,6 +322,15 @@ impl SettingsView {
 
     fn commit(&mut self, field: Field, window: &mut Window, cx: &mut Context<Self>) {
         let value = self.value(field, cx);
+        if field == Field::OnFinish {
+            if value != self.settings(cx).on_finish
+                && let Err(err) = self.engine.read(cx).core().set_on_finish(value)
+            {
+                window.push_notification(Notification::error(format!("{err:#}")), cx);
+            }
+            cx.notify();
+            return;
+        }
         let mut settings = self.settings(cx);
         match apply(field, &value, &mut settings) {
             Ok(()) => {
@@ -439,6 +425,89 @@ impl SettingsView {
             });
         })
         .detach();
+    }
+
+    fn export_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let folder = dirs::document_dir()
+            .or_else(dirs::home_dir)
+            .unwrap_or_default();
+        let picked = cx.prompt_for_new_path(&folder, Some("bawkbit-backup.json"));
+        let backup = self.engine.read(cx).core().backup();
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(path))) = picked.await else {
+                return;
+            };
+            let written = serde_json::to_vec_pretty(&backup)
+                .map_err(std::io::Error::other)
+                .and_then(|json| std::fs::write(&path, json));
+            let _ = cx.update(|window, cx| {
+                let note = match written {
+                    Ok(()) => Notification::success(format!("saved {}", path.display())),
+                    Err(err) => {
+                        Notification::error(format!("cannot save {}: {err}", path.display()))
+                    }
+                };
+                window.push_notification(note, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn import_backup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("restore".into()),
+        });
+        let engine = self.engine.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let Ok(job) = cx.update(|_, cx| {
+                engine.read(cx).run(move |core| async move {
+                    let bytes = std::fs::read(&path)?;
+                    let backup: Backup = serde_json::from_slice(&bytes)
+                        .map_err(|_| anyhow::anyhow!("that file is not a bawkbit backup"))?;
+                    core.restore(backup).await
+                })
+            }) else {
+                return;
+            };
+            let result = job.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let note = match result {
+                    Ok(()) => {
+                        this.reload(window, cx);
+                        Notification::success("settings restored")
+                    }
+                    Err(err) => Notification::error(format!("{err:#}")),
+                };
+                window.push_notification(note, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Puts the engine's settings back in every box, after a restore changed them underneath.
+    fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let s = self.settings(cx);
+        for (field, value) in field_values(&s) {
+            if let Some(input) = self.inputs.get(&field) {
+                input.update(cx, |state, cx| state.set_value(value, window, cx));
+            }
+        }
+        self.errors.clear();
+        self.indexers = s
+            .indexers
+            .iter()
+            .map(|indexer| self.indexer_row(indexer, window, cx))
+            .collect();
+        cx.notify();
     }
 
     fn pick_theme(&mut self, id: SharedString, mode: Mode, cx: &mut Context<Self>) {
@@ -559,6 +628,18 @@ impl SettingsView {
                         cx.notify();
                     })),
                 p,
+            ))
+            .child(field(
+                "when one finishes, run",
+                "%N name, %F file or folder, %D its folder, %L category, %G tags, %Z size, %C file count, %I id",
+                self.text(Field::OnFinish, p),
+                p,
+            ))
+            .child(field(
+                "check rss feeds every",
+                "minutes",
+                self.text(Field::RssMinutes, p),
+                p,
             ));
         #[cfg(windows)]
         let panel = {
@@ -617,6 +698,12 @@ impl SettingsView {
                 "dht",
                 "finds peers without trackers",
                 self.switch("dht", s.dht, |s, on| s.dht = on, cx),
+                p,
+            ))
+            .child(field(
+                "utp",
+                "also connects over utp, which the engine still calls new",
+                self.switch("utp", s.utp, |s, on| s.utp = on, cx),
                 p,
             ))
             .child(field(
@@ -957,6 +1044,63 @@ impl SettingsView {
             ))
     }
 
+    fn render_app(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let config = cx.global::<Config>().clone();
+        let config_switch = |id: &'static str, on: bool, change: fn(&mut Config, bool)| {
+            Switch::new(id)
+                .checked(on)
+                .on_click(move |checked: &bool, _, cx| {
+                    let checked = *checked;
+                    Config::edit(cx, |config| change(config, checked));
+                })
+        };
+        let panel = panel()
+            .child(field(
+                "tray icon",
+                "pause, resume and open bawkbit from the tray",
+                config_switch("tray", config.tray, |c, on| c.tray = on),
+                p,
+            ))
+            .child(field(
+                "keep running when closed",
+                "closing the window leaves downloads and seeding going",
+                config_switch("close-to-tray", config.close_to_tray, |c, on| {
+                    c.close_to_tray = on
+                })
+                .disabled(!config.tray),
+                p,
+            ))
+            .child(field(
+                "notify when done",
+                "a notification for each finished download",
+                config_switch("notify-finished", config.notify_finished, |c, on| {
+                    c.notify_finished = on
+                }),
+                p,
+            ));
+        if !autostart::supported() {
+            return panel;
+        }
+        panel.child(field(
+            "start at login",
+            if config.tray {
+                "starts in the tray"
+            } else {
+                ""
+            },
+            Switch::new("start-at-login")
+                .checked(self.start_at_login)
+                .on_click(cx.listener(|this, checked: &bool, window, cx| {
+                    match autostart::set(*checked) {
+                        Ok(()) => this.start_at_login = *checked,
+                        Err(err) => window.push_notification(Notification::error(err), cx),
+                    }
+                    cx.notify();
+                })),
+            p,
+        ))
+    }
+
     fn render_appearance(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
         let own = self.theme == DEFAULT_THEME;
         let modes = kit::segmented(p).children(
@@ -1164,6 +1308,32 @@ impl SettingsView {
                     .on_click(move |_, _, cx| cx.open_with_system(&home)),
                 p,
             ))
+            .child(field(
+                "backup",
+                "settings, categories, tags and rss, without passwords or api keys",
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        kit::button("export-backup", cx)
+                            .small()
+                            .icon(Icon::new(IconName::FileDown))
+                            .label("export")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.export_backup(window, cx)),
+                            ),
+                    )
+                    .child(
+                        kit::button("import-backup", cx)
+                            .small()
+                            .icon(Icon::new(IconName::FileUp))
+                            .label("import")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.import_backup(window, cx)),
+                            ),
+                    ),
+                p,
+            ))
             .child(
                 div()
                     .text_size(px(12.))
@@ -1226,8 +1396,63 @@ fn apply(field: Field, value: &str, s: &mut Settings) -> Result<(), &'static str
         Field::WebPort => s.web.port = port(value)?,
         Field::WebUser if value.is_empty() => return Err("pick a name"),
         Field::WebUser => s.web.username = value.into(),
+        Field::OnFinish => s.on_finish = value.into(),
+        Field::RssMinutes => s.rss_minutes = count(value)?,
     }
     Ok(())
+}
+
+fn field_values(s: &Settings) -> Vec<(Field, String)> {
+    vec![
+        (Field::DownloadDir, s.download_dir.clone()),
+        (Field::WatchDir, s.watch_dir.clone()),
+        (Field::Port, s.listen_port.to_string()),
+        (Field::PeerLimit, nonzero(s.peer_limit)),
+        (Field::DownLimit, format::rate_input(s.down_limit)),
+        (Field::UpLimit, format::rate_input(s.up_limit)),
+        (Field::AltDown, format::rate_input(s.alt_down_limit)),
+        (Field::AltUp, format::rate_input(s.alt_up_limit)),
+        (Field::From, format::clock(s.schedule.from)),
+        (Field::To, format::clock(s.schedule.to)),
+        (Field::MaxActive, nonzero(s.max_active_downloads)),
+        (
+            Field::Ratio,
+            if s.ratio_limit > 0.0 {
+                s.ratio_limit.to_string()
+            } else {
+                String::new()
+            },
+        ),
+        (Field::SeedMinutes, nonzero(s.seed_minutes)),
+        (Field::WebAddress, s.web.address.clone()),
+        (Field::WebPort, s.web.port.to_string()),
+        (Field::WebUser, s.web.username.clone()),
+        (Field::OnFinish, s.on_finish.clone()),
+        (Field::RssMinutes, nonzero(s.rss_minutes)),
+    ]
+}
+
+fn placeholder(field: Field) -> &'static str {
+    match field {
+        Field::DownloadDir => "",
+        Field::WatchDir => "off",
+        Field::Port => "",
+        Field::PeerLimit => "engine default",
+        Field::DownLimit => "no limit",
+        Field::UpLimit => "no limit",
+        Field::AltDown => "no limit",
+        Field::AltUp => "no limit",
+        Field::From => "08:00",
+        Field::To => "20:00",
+        Field::MaxActive => "no limit",
+        Field::Ratio => "seed forever",
+        Field::SeedMinutes => "seed forever",
+        Field::WebAddress => "0.0.0.0",
+        Field::WebPort => "",
+        Field::WebUser => "admin",
+        Field::OnFinish => "nothing",
+        Field::RssMinutes => "only when asked",
+    }
 }
 
 fn nonzero(value: u32) -> String {
@@ -1326,6 +1551,7 @@ impl Render for SettingsView {
             Tab::Queue => self.render_queue(&p),
             Tab::Search => self.render_search(&p, cx),
             Tab::Web => self.render_web(&s, &p, cx),
+            Tab::App => self.render_app(&p, cx),
             Tab::Appearance => self.render_appearance(&p, cx),
             Tab::About => self.render_about(&p, cx),
         };

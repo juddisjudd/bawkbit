@@ -456,6 +456,16 @@ impl TorrentStateLive {
                     res?;
                 }
             };
+            if let Some(group) = self.shared.group_ratelimits.load_full() {
+                tokio::select! {
+                    _ = tx.closed() => {
+                        continue;
+                    }
+                    res = group.prepare_for_upload(NonZeroU32::new(ci.size).unwrap()) => {
+                        res?;
+                    }
+                }
+            }
             if let Some(session) = self.shared.session.upgrade() {
                 tokio::select! {
                     _ = tx.closed() => {
@@ -1710,6 +1720,12 @@ impl PeerHandler {
                     .ratelimits
                     .prepare_for_download(NonZeroU32::new(request.length).unwrap())
                     .await?;
+
+                if let Some(group) = self.state.torrent().group_ratelimits.load_full() {
+                    group
+                        .prepare_for_download(NonZeroU32::new(request.length).unwrap())
+                        .await?;
+                }
 
                 if let Some(session) = self.state.torrent().session.upgrade() {
                     session

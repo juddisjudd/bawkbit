@@ -5,10 +5,12 @@
   import Check from '@lucide/svelte/icons/check'
   import CircleAlert from '@lucide/svelte/icons/circle-alert'
   import Folder from '@lucide/svelte/icons/folder'
+  import Gauge from '@lucide/svelte/icons/gauge'
   import HardDrive from '@lucide/svelte/icons/hard-drive'
   import Layers from '@lucide/svelte/icons/layers'
   import Network from '@lucide/svelte/icons/network'
   import Pause from '@lucide/svelte/icons/pause'
+  import RssIcon from '@lucide/svelte/icons/rss'
   import Search from '@lucide/svelte/icons/search'
   import Tag from '@lucide/svelte/icons/tag'
   import type { Component } from 'svelte'
@@ -35,6 +37,8 @@
       x: event.clientX,
       y: event.clientY,
       items: [
+        { label: 'rename…', action: () => app.renameCategory(name) },
+        { label: 'speed limits…', action: () => app.editCategoryLimits(name) },
         {
           label: 'change folder…',
           action: () =>
@@ -63,6 +67,7 @@
       x: event.clientX,
       y: event.clientY,
       items: [
+        { label: 'rename…', action: () => app.renameTag(tag) },
         {
           label: 'remove tag',
           danger: true,
@@ -86,6 +91,10 @@
       <Search size={14} />
       <span class="label">search</span>
     </button>
+    <button type="button" class={['item', app.view === 'rss' && 'active']} aria-current={app.view === 'rss'} onclick={() => app.openRss()}>
+      <RssIcon size={14} />
+      <span class="label">rss</span>
+    </button>
   </div>
 
   <div class="group">
@@ -106,16 +115,19 @@
     <div class="group">
       {#each categories as c (c.name)}
         {@const active = app.view === 'list' && app.category === c.name}
+        {@const limited = c.down_limit > 0 || c.up_limit > 0}
+        {@const limits = limited ? `shared limits: ↓ ${c.down_limit ? bytes(c.down_limit) + '/s' : 'none'}, ↑ ${c.up_limit ? bytes(c.up_limit) + '/s' : 'none'}` : ''}
         <button
           type="button"
           class={['item', active && 'active']}
           aria-current={active}
-          title={c.save_path || undefined}
+          title={[c.save_path, limits].filter(Boolean).join('\n') || undefined}
           onclick={() => (active ? app.filterBy('all') : app.filterBy('all', c.name))}
           oncontextmenu={(e) => categoryMenu(e, c.name, c.save_path)}
         >
           <Folder size={14} />
           <span class="label truncate">{c.name}</span>
+          {#if limited}<Gauge size={12} class="limited" aria-label="speed limited" />{/if}
           {#if app.counts.categories.get(c.name)}<span class="n num">{app.counts.categories.get(c.name)}</span>{/if}
         </button>
       {/each}
@@ -209,6 +221,9 @@
   }
   .label {
     flex: 1;
+  }
+  .item :global(svg.limited) {
+    color: var(--text-weaker);
   }
   .n {
     color: var(--text-weak);

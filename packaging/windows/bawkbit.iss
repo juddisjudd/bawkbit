@@ -2,6 +2,7 @@
   #error Pass the version, for example: iscc /DAppVersion=0.1.0 bawkbit.iss
 #endif
 #define Classes "Software\Classes"
+#define Run "Software\Microsoft\Windows\CurrentVersion\Run"
 
 [Setup]
 AppId={{8C41E2B7-5D3A-4F60-9B1E-7A2D6C9E4F15}
@@ -75,4 +76,7 @@ begin
     RegDeleteKeyIncludingSubkeys(HKCU, '{#Classes}\magnet');
   if RegQueryStringValue(HKCU, '{#Classes}\.torrent', '', Value) and (Value = 'bawkbit.torrent') then
     RegDeleteValue(HKCU, '{#Classes}\.torrent', '');
+  if RegQueryStringValue(HKCU, '{#Run}', 'bawkbit', Value)
+    and (Pos(Lowercase(ExpandConstant('{app}\bawkbit.exe')), Lowercase(Value)) > 0) then
+    RegDeleteValue(HKCU, '{#Run}', 'bawkbit');
 end;

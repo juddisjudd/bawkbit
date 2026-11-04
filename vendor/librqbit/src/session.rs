@@ -1374,6 +1374,7 @@ impl Session {
                     disable_upload: AtomicBool::new(false),
                 },
                 ratelimits: Arc::new(Limits::new(opts.ratelimits)),
+                group_ratelimits: Default::default(),
                 connector: self.connector.clone(),
                 session: Arc::downgrade(self),
                 magnet_name: name,

@@ -30,7 +30,15 @@ pub struct Config {
     /// Adds magnet links straight away instead of showing their files first.
     pub quick_add: bool,
     pub check_updates: bool,
+    pub tray: bool,
+    /// Closing the window leaves bawkbit downloading and seeding in the tray.
+    pub close_to_tray: bool,
+    pub notify_finished: bool,
+    /// Set once bawkbit has said that closing the window left it running.
+    pub told_about_tray: bool,
 }
+
+impl gpui_kit::Global for Config {}
 
 impl Default for Config {
     fn default() -> Self {
@@ -41,6 +49,10 @@ impl Default for Config {
             descending: true,
             quick_add: false,
             check_updates: true,
+            tray: true,
+            close_to_tray: true,
+            notify_finished: true,
+            told_about_tray: false,
         }
     }
 }
@@ -55,6 +67,13 @@ impl Config {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default()
+    }
+
+    pub fn edit(cx: &mut gpui_kit::App, change: impl FnOnce(&mut Config)) {
+        gpui_kit::BorrowAppContext::update_global::<Config, _>(cx, |config, _| {
+            change(config);
+            config.save();
+        });
     }
 
     pub fn save(&self) {

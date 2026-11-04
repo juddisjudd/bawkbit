@@ -17,7 +17,11 @@
   async function submit(event: SubmitEvent): Promise<void> {
     event.preventDefault()
     busy = true
-    const ok = await app.setLimits(edit.ids, limitBytes(values.down, units.down), limitBytes(values.up, units.up))
+    const down = limitBytes(values.down, units.down)
+    const up = limitBytes(values.up, units.up)
+    const ok = edit.category
+      ? await app.act({ action: 'set_category_limits', name: edit.category, down, up })
+      : await app.setLimits(edit.ids, down, up)
     busy = false
     if (ok) app.limits = null
   }
@@ -32,7 +36,11 @@
 
 <div class="backdrop" role="presentation" onmousedown={(e) => e.target === e.currentTarget && (app.limits = null)}>
   <form class="dialog" aria-label="speed limits" onsubmit={submit}>
-    {#if count > 1}<p class="muted">for {count} torrents</p>{/if}
+    {#if edit.category}
+      <p class="muted">shared by every torrent in {edit.category}</p>
+    {:else if count > 1}
+      <p class="muted">for {count} torrents</p>
+    {/if}
     {@render field('down', 'download')}
     {@render field('up', 'upload')}
     <div class="actions">

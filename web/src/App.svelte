@@ -7,6 +7,7 @@
   import LimitsDialog from '$lib/components/LimitsDialog.svelte'
   import Login from '$lib/components/Login.svelte'
   import PromptDialog from '$lib/components/PromptDialog.svelte'
+  import RssPage from '$lib/components/RssPage.svelte'
   import SearchPage from '$lib/components/SearchPage.svelte'
   import Settings from '$lib/components/Settings.svelte'
   import Sidebar from '$lib/components/Sidebar.svelte'
@@ -36,7 +37,7 @@
       if (app.filtersOpen) app.filtersOpen = false
       else if (app.detailsOpen) app.detailsOpen = false
       else if (app.view === 'settings') app.view = 'list'
-      else if (app.view === 'search') {
+      else if (app.view === 'search' || app.view === 'rss') {
         if (!typing(event.target)) app.view = 'list'
       } else app.clearSelection()
       return
@@ -123,6 +124,8 @@
         <main class="main">
           {#if app.view === 'search'}
             <SearchPage bind:this={searchPage} {compact} />
+          {:else if app.view === 'rss'}
+            <RssPage {compact} />
           {:else}
             <TorrentList bind:this={list} {compact} />
             {#if app.detailsOpen && app.focused}

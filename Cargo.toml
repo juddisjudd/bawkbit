@@ -26,7 +26,7 @@ getrandom = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 serde ={ version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net", "signal", "io-util"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "net", "signal", "io-util", "process"] }
 tracing = "0.1"
 bawkbit-core = { path = "crates/core" }
 bawkbit-web = { path = "crates/web" }
@@ -39,6 +39,7 @@ bawkbit-web.workspace = true
 chrono.workspace = true
 dirs.workspace = true
 gpui-kit = "=0.7.3"
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 log = "0.4.34"
 reqwest.workspace = true
 serde.workspace = true
@@ -47,8 +48,12 @@ sha2 = "0.11.1"
 tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
 windows-registry = "0.6.1"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3.7"
 
 [dev-dependencies]
 image = { version = "0.25.10", default-features = false, features = ["ico", "png"] }
