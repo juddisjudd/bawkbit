@@ -4,6 +4,7 @@ use bawkbit_core::Settings;
 use bawkbit_core::settings::{Indexer, IndexerKind};
 use bawkbit_web::Status as WebStatus;
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
@@ -12,6 +13,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use super::kit;
+use super::updates::{UpdateState, Updates};
 use crate::config::Config;
 use crate::engine::Engine;
 use crate::format;
@@ -91,10 +93,12 @@ enum Field {
 pub enum SettingsEvent {
     Theme(SharedString, Mode),
     QuickAdd(bool),
+    CheckUpdates(bool),
 }
 
 pub struct SettingsView {
     engine: Entity<Engine>,
+    updates: Entity<Updates>,
     tab: Tab,
     theme: SharedString,
     mode: Mode,
@@ -124,6 +128,7 @@ impl EventEmitter<SettingsEvent> for SettingsView {}
 impl SettingsView {
     pub fn new(
         engine: Entity<Engine>,
+        updates: Entity<Updates>,
         config: &Config,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -191,9 +196,11 @@ impl SettingsView {
                 .placeholder("new password")
                 .masked(true)
         });
+        subscriptions.push(cx.observe(&updates, |_, _, cx| cx.notify()));
         let stored = engine.read(cx).core().settings().indexers;
         let mut this = Self {
             engine,
+            updates,
             tab: Tab::Downloads,
             theme: config.theme.clone().into(),
             mode: config.mode,
@@ -483,6 +490,7 @@ impl SettingsView {
     }
 
     fn render_tabs(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let update = self.updates.read(cx).has_news();
         div()
             .w(px(170.))
             .flex_none()
@@ -505,6 +513,9 @@ impl SettingsView {
                     .hover(|style| style.text_color(p.text_strong))
                     .child(Icon::new(tab.icon()).size(px(15.)))
                     .child(div().flex_1().child(tab.label()))
+                    .when(tab == Tab::About && update, |this| {
+                        this.child(kit::dot(p.yolk))
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tab = tab;
                         cx.notify();
@@ -983,6 +994,121 @@ impl SettingsView {
         panel().child(modes).child(cards)
     }
 
+    fn render_update(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let state = self.updates.read(cx).state.clone();
+        let (icon, color, text): (IconName, Hsla, String) = match &state {
+            UpdateState::Idle => (IconName::RefreshCw, p.icon, "not checked yet".into()),
+            UpdateState::Checking => (IconName::RefreshCw, p.icon, "checking for updates…".into()),
+            UpdateState::Current => (
+                IconName::CircleCheck,
+                p.success,
+                "you have the newest version".into(),
+            ),
+            UpdateState::Available(release) => (
+                IconName::Download,
+                p.yolk,
+                format!("bawkbit {} is out", release.version),
+            ),
+            UpdateState::Downloading {
+                version,
+                done,
+                total,
+            } => (
+                IconName::Download,
+                p.yolk,
+                format!(
+                    "downloading {version}… {} of {}",
+                    format::bytes(*done),
+                    format::bytes(*total)
+                ),
+            ),
+            UpdateState::Ready { version, .. } => (
+                IconName::CircleCheck,
+                p.success,
+                format!("{version} is installed. restart to use it."),
+            ),
+            UpdateState::Failed(error) => (IconName::CircleAlert, p.danger, error.clone()),
+        };
+        let blocked = match &state {
+            UpdateState::Available(_) => crate::updater::install_path().err(),
+            _ => None,
+        };
+        let updates = self.updates.clone();
+        let action = match &state {
+            UpdateState::Idle | UpdateState::Current | UpdateState::Failed(_) => Some(
+                kit::button("check-updates-now", cx)
+                    .small()
+                    .label(if matches!(state, UpdateState::Failed(_)) {
+                        "try again"
+                    } else {
+                        "check now"
+                    })
+                    .on_click(move |_, _, cx| updates.update(cx, |updates, cx| updates.check(cx))),
+            ),
+            UpdateState::Available(_) if blocked.is_none() => Some(
+                Button::new("install-update")
+                    .primary()
+                    .small()
+                    .label("update")
+                    .on_click(move |_, _, cx| {
+                        updates.update(cx, |updates, cx| updates.install(cx))
+                    }),
+            ),
+            UpdateState::Ready { .. } => Some(
+                Button::new("restart-update")
+                    .primary()
+                    .small()
+                    .label("restart now")
+                    .on_click(move |_, _, cx| {
+                        updates.update(cx, |updates, cx| updates.restart(cx))
+                    }),
+            ),
+            _ => None,
+        };
+        let notes = match &state {
+            UpdateState::Available(release) => Some(release.page.clone()),
+            _ => None,
+        };
+        let fraction = match &state {
+            UpdateState::Downloading { done, total, .. } => {
+                Some((*done as f32 / (*total).max(1) as f32).min(1.0))
+            }
+            _ => None,
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_4()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(p.border_weak)
+            .bg(p.bg_weak)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(Icon::new(icon).size(px(16.)).text_color(color))
+                    .child(div().flex_1().min_w_0().text_color(p.text).child(text))
+                    .children(notes.map(|page| {
+                        kit::button("release-notes", cx)
+                            .small()
+                            .icon(Icon::new(IconName::ExternalLink))
+                            .label("what's new")
+                            .on_click(move |_, _, cx| cx.open_url(&page))
+                    }))
+                    .children(action),
+            )
+            .children(blocked.map(|reason| {
+                div()
+                    .text_size(px(12.))
+                    .text_color(p.text_weak)
+                    .child(reason)
+            }))
+            .children(fraction.map(|fraction| kit::progress_bar(fraction, p.yolk, p)))
+    }
+
     fn render_about(&self, p: &Palette, cx: &mut Context<Self>) -> Div {
         let home = bawkbit_core::data_dir();
         panel()
@@ -1014,6 +1140,20 @@ impl SettingsView {
                             ),
                     ),
             )
+            .child(self.render_update(p, cx))
+            .child(field(
+                "check for updates",
+                "asks github once a day",
+                Switch::new("check-updates")
+                    .checked(self.updates.read(cx).automatic())
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        let on = *checked;
+                        this.updates
+                            .update(cx, |updates, cx| updates.set_automatic(on, cx));
+                        cx.emit(SettingsEvent::CheckUpdates(on));
+                    })),
+                p,
+            ))
             .child(field(
                 "settings and session",
                 "",

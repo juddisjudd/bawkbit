@@ -49,6 +49,10 @@ impl Engine {
         &self.core
     }
 
+    pub fn runtime(&self) -> tokio::runtime::Handle {
+        self.runtime.clone()
+    }
+
     pub fn web_status(&self) -> Status {
         self.web.status()
     }

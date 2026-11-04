@@ -1,7 +1,7 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const HELLO: &str = "bawkbit";
 
@@ -42,8 +42,19 @@ fn port(home: &Path) -> u16 {
     41000 + (hash % 9000) as u16
 }
 
-pub fn claim(home: &Path, args: &[String]) -> Claim {
+/// `patience` is how long a copy started by an update waits for the one it replaces to quit and free the port.
+pub fn claim(home: &Path, args: &[String], patience: Duration) -> Claim {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port(home)));
+    let deadline = Instant::now() + patience;
+    while Instant::now() < deadline {
+        match TcpListener::bind(addr) {
+            Ok(listener) => return Claim::Primary(Some(listener)),
+            Err(err) if err.kind() == ErrorKind::AddrInUse => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    }
     if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(400)) {
         let mut message = format!("{HELLO}\n");
         for arg in args {
@@ -164,19 +175,45 @@ mod tests {
         assert!((41000..50000).contains(&a));
     }
 
+    /// A data folder whose port this machine lets a test bind, as Windows reserves some port ranges.
+    fn free_home(name: &str) -> std::path::PathBuf {
+        (0..)
+            .map(|n| {
+                std::env::temp_dir().join(format!("bawkbit-{name}-{}-{n}", std::process::id()))
+            })
+            .find(|home| TcpListener::bind((Ipv4Addr::LOCALHOST, port(home))).is_ok())
+            .unwrap()
+    }
+
     #[test]
     fn a_second_launch_forwards_its_arguments() {
-        let home = std::env::temp_dir().join(format!("bawkbit-instance-{}", std::process::id()));
-        let Claim::Primary(Some(listener)) = claim(&home, &[]) else {
+        let home = free_home("instance");
+        let Claim::Primary(Some(listener)) = claim(&home, &[], Duration::ZERO) else {
             panic!("the first launch should listen");
         };
         let (sender, receiver) = async_channel::unbounded();
         listen(listener, sender);
         let link = "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c".to_string();
         assert!(matches!(
-            claim(&home, std::slice::from_ref(&link)),
+            claim(&home, std::slice::from_ref(&link), Duration::ZERO),
             Claim::Forwarded
         ));
         assert_eq!(receiver.recv_blocking().unwrap(), vec![link]);
+    }
+
+    #[test]
+    fn a_launch_after_an_update_waits_for_the_old_copy_to_quit() {
+        let home = free_home("update");
+        let Claim::Primary(Some(old)) = claim(&home, &[], Duration::ZERO) else {
+            panic!("the old copy should listen");
+        };
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(old);
+        });
+        let claimed = claim(&home, &[], Duration::from_secs(10));
+        assert!(matches!(claimed, Claim::Primary(Some(_))));
+        assert!(started.elapsed() >= Duration::from_millis(300));
     }
 }

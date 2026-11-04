@@ -29,6 +29,7 @@ pub struct Config {
     pub descending: bool,
     /// Adds magnet links straight away instead of showing their files first.
     pub quick_add: bool,
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -39,6 +40,7 @@ impl Default for Config {
             sort: Column::Added,
             descending: true,
             quick_add: false,
+            check_updates: true,
         }
     }
 }

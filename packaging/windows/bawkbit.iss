@@ -53,6 +53,12 @@ Root: HKCU; Subkey: "{#Classes}\bawkbit.torrent\DefaultIcon"; ValueType: string;
 Root: HKCU; Subkey: "{#Classes}\bawkbit.torrent\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\bawkbit.exe"" ""%1"""; Tasks: links
 Root: HKCU; Subkey: "{#Classes}\.torrent"; ValueType: string; ValueName: ""; ValueData: "bawkbit.torrent"; Tasks: links
 
+[UninstallDelete]
+Type: files; Name: "{app}\bawkbit.old.exe"
+Type: files; Name: "{app}\bawkbit.new.exe"
+Type: files; Name: "{app}\bawkbitd.old.exe"
+Type: files; Name: "{app}\bawkbitd.new.exe"
+
 [Run]
 Filename: "{app}\bawkbit.exe"; Description: "Start bawkbit"; Flags: nowait postinstall skipifsilent
 

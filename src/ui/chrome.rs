@@ -315,6 +315,7 @@ impl Workspace {
 
         let search_active = self.page == Page::Search;
         let settings_active = self.page == Page::Settings;
+        let update = self.updates.read(cx).has_news();
         let has_categories = !categories.is_empty();
         let has_tags = !tags.is_empty();
 
@@ -366,6 +367,7 @@ impl Workspace {
                     0,
                     settings_active,
                 )
+                .when(update, |this| this.child(kit::dot(p.yolk)))
                 .on_click(
                     cx.listener(|this, _, window, cx| this.select(Page::Settings, window, cx)),
                 ),

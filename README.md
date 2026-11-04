@@ -51,6 +51,12 @@ bawkbit searches through [Prowlarr](https://prowlarr.com) or [Jackett](https://g
 
 Results come from every source you turn on at once. A torrent that several trackers list shows once. Type in the refine box to narrow the results: `-word` leaves a word out, and `>1GB` or `<500MB` limits the size.
 
+### Updates
+
+bawkbit asks GitHub for a new version once a day. When there is one, a dot shows on **settings**. Open **settings → about**, press **update**, then **restart now**. bawkbit checks the download against its SHA-256 checksum before it replaces anything, and your torrents carry on after the restart.
+
+The Windows installer, the Windows zip and the AppImage update this way. Update the `.deb` and `.rpm` with your package manager, and Docker by pulling the new image. Turn the daily check off under **settings → about**.
+
 ### Without a window
 
 `bawkbitd` is the engine and the web UI on their own. Start it, and it prints a password for the web UI on first start:
@@ -100,6 +106,7 @@ Double-click a torrent to open its folder. Right-click it for everything else.
 - **Details** for each torrent: a piece map, files with per-file progress and selection, peers and trackers.
 - **DHT**, UPnP port forwarding and peer exchange through the engine.
 - **One instance**: opening a magnet link while bawkbit runs hands it to the open window.
+- **Updates itself** from the releases page, after checking each download's checksum.
 - **Themes**: dark, light, follow your system, or one of 30 named themes.
 
 bawkbit takes its ideas from two older clients. From [qBittorrent](https://github.com/qbittorrent/qBittorrent): categories with save paths, tags, the filter sidebar, alternative speed limits with a schedule, the queue and the built-in web UI. From [Deluge](https://github.com/deluge-torrent/deluge): the split between the engine and the windows that show it, so the same engine runs behind the desktop app, the web UI and the headless daemon.

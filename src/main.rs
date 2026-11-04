@@ -8,6 +8,9 @@ mod instance;
 mod logging;
 mod theme;
 mod ui;
+mod updater;
+
+use std::time::Duration;
 
 use bawkbit_core::Core;
 use gpui_kit::component::TitleBar;
@@ -20,10 +23,17 @@ fn main() {
     logging::init();
     let args = instance::launch_args();
     let home = bawkbit_core::data_dir();
-    let listener = match instance::claim(&home, &args) {
+    let after_update = std::env::args().any(|arg| arg == updater::AFTER_UPDATE);
+    let patience = Duration::from_secs(if after_update { 30 } else { 0 });
+    let listener = match instance::claim(&home, &args, patience) {
         Claim::Forwarded => return,
         Claim::Primary(listener) => listener,
     };
+    #[cfg(windows)]
+    {
+        updater::clean_up();
+        updater::sync_installed_version();
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -96,7 +106,7 @@ impl Global for Runtime {}
 impl Drop for Runtime {
     fn drop(&mut self) {
         if let Some(runtime) = self.0.take() {
-            runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+            runtime.shutdown_timeout(Duration::from_secs(2));
         }
     }
 }

@@ -6,6 +6,7 @@ mod kit;
 mod list;
 mod search;
 mod settings;
+mod updates;
 
 use bawkbit_core::{Action, AddRequest, Source};
 use gpui_kit::component::notification::Notification;
@@ -23,6 +24,7 @@ use filter::Status;
 use list::{ListEvent, TorrentList};
 use search::{SearchEvent, SearchView};
 use settings::{SettingsEvent, SettingsView};
+use updates::{UpdateFound, Updates};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
@@ -59,6 +61,7 @@ pub struct Workspace {
     details: Entity<DetailsView>,
     search: Entity<SearchView>,
     settings: Entity<SettingsView>,
+    updates: Entity<Updates>,
     focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
     _inbox: Task<()>,
@@ -78,13 +81,24 @@ impl Workspace {
         let list = cx.new(|cx| TorrentList::new(engine.clone(), &config, window, cx));
         let details = cx.new(|cx| DetailsView::new(engine.clone(), cx));
         let search = cx.new(|cx| SearchView::new(engine.clone(), window, cx));
-        let settings = cx.new(|cx| SettingsView::new(engine.clone(), &config, window, cx));
+        let runtime = engine.read(cx).runtime();
+        let updates = cx.new(|cx| Updates::new(config.check_updates, runtime, cx));
+        let settings =
+            cx.new(|cx| SettingsView::new(engine.clone(), updates.clone(), &config, window, cx));
 
         let subscriptions = vec![
             cx.observe(&engine, |_, _, cx| cx.notify()),
             cx.subscribe_in(&list, window, Self::on_list),
             cx.subscribe_in(&settings, window, Self::on_settings),
             cx.subscribe_in(&search, window, Self::on_search),
+            cx.subscribe_in(&updates, window, |_, _, found: &UpdateFound, window, cx| {
+                let note = format!(
+                    "bawkbit {} is out. open settings → about to update.",
+                    found.0
+                );
+                window.push_notification(note, cx);
+            }),
+            cx.observe(&updates, |_, _, cx| cx.notify()),
             cx.subscribe(&details, |this, _, _: &DetailsEvent, cx| {
                 this.list.update(cx, |list, cx| list.clear_focus(cx));
             }),
@@ -116,6 +130,7 @@ impl Workspace {
             details,
             search,
             settings,
+            updates,
             focus: cx.focus_handle(),
             _subscriptions: subscriptions,
             _inbox: inbox,
@@ -187,6 +202,7 @@ impl Workspace {
                 theme::apply(id, *mode, Some(window), cx);
             }
             SettingsEvent::QuickAdd(on) => self.config.quick_add = *on,
+            SettingsEvent::CheckUpdates(on) => self.config.check_updates = *on,
         }
         self.config.save();
         cx.notify();
