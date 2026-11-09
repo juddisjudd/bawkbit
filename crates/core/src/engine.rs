@@ -21,11 +21,13 @@ use librqbit::{
 use tokio::sync::{broadcast, watch};
 
 use crate::api::*;
+use crate::geoip::Countries;
 use crate::magnet;
 use crate::rss::Feeds;
 use crate::search;
 use crate::settings::{Indexer, Settings};
 use crate::store::{Entry, Store, Waiting};
+use crate::trackers;
 
 const HISTORY: usize = 300;
 const PIECE_MAP: usize = 400;
@@ -39,6 +41,8 @@ struct Paths {
     session: PathBuf,
     dht: PathBuf,
     rss: PathBuf,
+    countries: PathBuf,
+    tracker_lists: PathBuf,
 }
 
 impl Paths {
@@ -49,9 +53,17 @@ impl Paths {
             session: root.join("session"),
             dht: root.join("dht.json"),
             rss: root.join("rss.json"),
+            countries: root.join("dbip-country-lite.mmdb"),
+            tracker_lists: root.join("tracker-lists.json"),
         }
     }
 }
+
+/// A tracker has to fail this long, without one answer since the torrent started, before it counts as dead.
+const DEAD_AFTER: Duration = Duration::from_secs(60 * 60);
+const DEAD_FAILURES: u32 = 3;
+/// Ticks between looks for dead trackers.
+const PRUNE_TICKS: u64 = 5 * 60;
 
 /// A torrent that just finished, with what the finish program is told about it.
 struct Done {
@@ -122,8 +134,13 @@ struct Inner {
     rev: AtomicU64,
     rebuilding: tokio::sync::Mutex<()>,
     http: reqwest::Client,
+    /// For files from fixed addresses that may redirect, such as the country database.
+    downloads: reqwest::Client,
     feeds: Feeds,
     finished: broadcast::Sender<Finished>,
+    countries: Countries,
+    lists: trackers::Lists,
+    pruning: AtomicBool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -152,6 +169,8 @@ impl Core {
         let session = build_session(&paths, &settings).await?;
         let (snapshot, _) = watch::channel(Arc::new(Snapshot::default()));
         let feeds = Feeds::load(paths.rss.clone());
+        let countries = Countries::load(paths.countries.clone());
+        let lists = trackers::Lists::load(paths.tracker_lists.clone());
 
         let core = Core {
             inner: Arc::new(Inner {
@@ -167,8 +186,12 @@ impl Core {
                 rev: AtomicU64::new(0),
                 rebuilding: tokio::sync::Mutex::new(()),
                 http: search::client(),
+                downloads: download_client(),
                 feeds,
                 finished: broadcast::channel(64).0,
+                countries,
+                lists,
+                pruning: AtomicBool::new(false),
             }),
         };
         core.tick().await;
@@ -194,7 +217,64 @@ impl Core {
                 }
             }
         });
+        let keeper = core.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                keeper.update_downloads().await;
+            }
+        });
         Ok(core)
+    }
+
+    /// Fetches the country database and the tracker lists when they are turned on and out of date.
+    async fn update_downloads(&self) {
+        let settings = self.settings();
+        if settings.peer_countries {
+            self.inner.countries.update(&self.inner.downloads).await;
+        }
+        if settings.trackers.add_from_lists {
+            let lists = &settings.trackers.lists;
+            self.inner
+                .lists
+                .refresh(&self.inner.downloads, lists, false)
+                .await;
+        }
+    }
+
+    fn spawn_update_downloads(&self) {
+        let core = self.clone();
+        tokio::spawn(async move { core.update_downloads().await });
+    }
+
+    pub fn tracker_lists(&self) -> TrackerLists {
+        self.inner.lists.info(&self.settings().trackers.lists)
+    }
+
+    /// Reads every public tracker list under settings again.
+    pub async fn refresh_tracker_lists(&self) -> TrackerLists {
+        let lists = self.settings().trackers.lists;
+        self.inner
+            .lists
+            .refresh(&self.inner.downloads, &lists, true)
+            .await;
+        self.inner.lists.info(&lists)
+    }
+
+    /// The list trackers, read now when nothing was read yet.
+    async fn list_trackers(&self) -> Vec<String> {
+        let lists = self.settings().trackers.lists;
+        let cached = self.inner.lists.cached(&lists);
+        if !cached.is_empty() {
+            return cached;
+        }
+        self.inner
+            .lists
+            .refresh(&self.inner.downloads, &lists, false)
+            .await;
+        self.inner.lists.cached(&lists)
     }
 
     /// Picks up the magnet links that were still fetching their file list when bawkbit last stopped.
@@ -377,10 +457,17 @@ impl Core {
 
     pub async fn update_settings(&self, incoming: Settings) -> Result<Settings> {
         let old = self.settings();
-        let new = old.merge_from_client(incoming);
+        let mut new = old.merge_from_client(incoming);
         if new.download_dir.trim().is_empty() {
             bail!("pick a download folder");
         }
+        let mut lists: Vec<String> = Vec::new();
+        for list in new.trackers.lists.iter().map(|list| list.trim()) {
+            if !list.is_empty() && !lists.iter().any(|known| known == list) {
+                lists.push(list.to_string());
+            }
+        }
+        new.trackers.lists = lists;
         new.save(&self.inner.paths.settings)
             .context("cannot save the settings")?;
         *self
@@ -388,6 +475,14 @@ impl Core {
             .settings
             .write()
             .unwrap_or_else(|p| p.into_inner()) = new.clone();
+        if old.download_dir != new.download_dir {
+            self.edit_store(|store| store.last_save_path = None);
+        }
+        let lists_wanted = new.trackers.add_from_lists
+            && (!old.trackers.add_from_lists || old.trackers.lists != new.trackers.lists);
+        if (new.peer_countries && !old.peer_countries) || lists_wanted {
+            self.spawn_update_downloads();
+        }
         if old.needs_new_session(&new) || old.download_dir != new.download_dir {
             self.rebuild_session().await?;
         }
@@ -471,19 +566,42 @@ impl Core {
             Action::ForceStart { ids } => self.resume(ids, true).await,
             Action::Recheck { ids } => {
                 for id in ids {
-                    let trackers = self
-                        .handle(&id)?
-                        .shared()
-                        .trackers
-                        .iter()
-                        .map(|url| url.to_string())
-                        .collect();
+                    let trackers = trackers_of(&self.handle(&id)?);
                     self.reload(&id, trackers, false).await?;
                 }
             }
             Action::SetTrackers { id, trackers } => {
                 let trackers = clean_trackers(trackers)?;
                 self.reload(&id, trackers, true).await?;
+            }
+            Action::AddListTrackers { ids } => {
+                let extra = self.list_trackers().await;
+                if extra.is_empty() {
+                    bail!(
+                        "the tracker lists gave no trackers; check them under settings, trackers"
+                    );
+                }
+                let mut failed = Vec::new();
+                for id in ids {
+                    let Ok(handle) = self.handle(&id) else {
+                        continue;
+                    };
+                    if is_private(&handle) {
+                        continue;
+                    }
+                    let own = trackers_of(&handle);
+                    let merged = trackers::merge(&own, &extra);
+                    drop(handle);
+                    if merged.len() > own.len()
+                        && let Err(err) = self.reload(&id, merged, true).await
+                    {
+                        tracing::warn!("cannot add list trackers to {id}: {err:#}");
+                        failed.push(err);
+                    }
+                }
+                if let Some(first) = failed.first() {
+                    bail!("{} torrents kept their trackers: {first:#}", failed.len());
+                }
             }
             Action::SetNoUpload { ids, on } => self.edit_store(|store| {
                 for id in ids {
@@ -707,12 +825,7 @@ impl Core {
             .ok_or_else(|| anyhow!("wait until it has found its files"))?;
         let hash = handle.info_hash();
         let paused = handle.is_paused();
-        let before: Vec<String> = handle
-            .shared()
-            .trackers
-            .iter()
-            .map(|url| url.to_string())
-            .collect();
+        let before = trackers_of(&handle);
         let output = handle.output_folder().to_string_lossy().into_owned();
         let only_files = handle.only_files();
         let options = || AddTorrentOptions {
@@ -769,7 +882,7 @@ impl Core {
 
     /// Fetches a torrent's file list without adding it, for the add dialog.
     pub async fn preview(&self, source: Source) -> Result<Preview> {
-        let settings = self.settings();
+        let save_path = self.offered_save_path();
         let (id, resolved_existing) = match &source {
             Source::Resolved(id) => (id.clone(), true),
             _ => (self.resolve(source).await?, false),
@@ -787,9 +900,36 @@ impl Core {
             name: resolved.name.clone(),
             size: resolved.size,
             files: resolved.files.clone(),
-            save_path: settings.download_dir,
+            save_path,
             existing,
         })
+    }
+
+    /// The folder last picked in an add dialog while it is still there, or the download folder.
+    fn offered_save_path(&self) -> String {
+        let last = lock(&self.inner.store).last_save_path.clone();
+        last.filter(|path| Path::new(path).is_dir())
+            .unwrap_or_else(|| self.settings().download_dir)
+    }
+
+    fn remember_save_path(&self, request: &AddRequest) {
+        let picked = request.save_path.as_deref().map(str::trim);
+        let no_category = request
+            .category
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty());
+        let Some(picked) = picked.filter(|path| !path.is_empty()) else {
+            return;
+        };
+        if !request.remember_path || !no_category {
+            return;
+        }
+        let default = self.settings().download_dir;
+        let remembered =
+            (Path::new(picked) != Path::new(default.trim())).then(|| picked.to_string());
+        if lock(&self.inner.store).last_save_path != remembered {
+            self.edit_store(|store| store.last_save_path = remembered);
+        }
     }
 
     /// Gets a torrent's metadata into the resolved cache and returns its id.
@@ -1002,10 +1142,12 @@ impl Core {
             initial_peers: Some(resolved.peers),
             ..Default::default()
         };
+        let bytes = self.with_list_trackers(resolved.bytes, &settings);
         self.session()
-            .add_torrent(AddTorrent::from_bytes(resolved.bytes), Some(options))
+            .add_torrent(AddTorrent::from_bytes(bytes), Some(options))
             .await
             .map_err(|err| anyhow!("{err:#}"))?;
+        self.remember_save_path(request);
         if !request.skip_check {
             lock(&self.inner.live).downloading.insert(id.to_string());
         }
@@ -1026,6 +1168,27 @@ impl Core {
         });
         self.tick().await;
         Ok(())
+    }
+
+    /// The torrent with the list trackers added to its own, unless it is private or the lists are off.
+    fn with_list_trackers(&self, bytes: Bytes, settings: &Settings) -> Bytes {
+        if !settings.trackers.add_from_lists {
+            return bytes;
+        }
+        let extra = self.inner.lists.cached(&settings.trackers.lists);
+        let rebuilt = librqbit::torrent_from_bytes(&bytes)
+            .ok()
+            .filter(|parsed| !parsed.info.data.private)
+            .and_then(|parsed| {
+                let own: Vec<String> = parsed
+                    .iter_announce()
+                    .map(|tracker| String::from_utf8_lossy(tracker.as_ref()).into_owned())
+                    .collect();
+                let merged = trackers::merge(&own, &extra);
+                (merged.len() > trackers::merge(&own, &Vec::new()).len())
+                    .then(|| torrent_file(parsed.info.raw_bytes.as_ref(), &merged))
+            });
+        rebuilt.map(Bytes::from).unwrap_or(bytes)
     }
 
     fn queue_is_full(&self, settings: &Settings) -> bool {
@@ -1111,13 +1274,9 @@ impl Core {
             }
         };
         let peers = self.peers(id, &api, key);
-        let mut trackers: Vec<String> = handle
-            .shared()
-            .trackers
-            .iter()
-            .map(|url| url.to_string())
-            .collect();
+        let mut trackers = trackers_of(&handle);
         trackers.sort();
+        let tracker_reports = self.tracker_reports(&handle, &trackers);
         let name = handle.name().unwrap_or_else(|| id.to_string());
         Ok(Details {
             id: id.to_string(),
@@ -1131,7 +1290,81 @@ impl Core {
             files,
             peers,
             trackers,
+            tracker_reports,
+            private: is_private(&handle),
         })
+    }
+
+    fn tracker_reports(&self, handle: &Handle, trackers: &[String]) -> Vec<TrackerReport> {
+        let statuses = self.session().tracker_status(handle.info_hash());
+        trackers
+            .iter()
+            .map(|url| {
+                let status = reqwest::Url::parse(url)
+                    .ok()
+                    .and_then(|url| statuses.get(&url).cloned())
+                    .unwrap_or_default();
+                TrackerReport {
+                    url: url.clone(),
+                    status: match status.state {
+                        librqbit::TrackerState::NotContacted => TrackerStatus::Waiting,
+                        librqbit::TrackerState::Working => TrackerStatus::Working,
+                        librqbit::TrackerState::Failing => TrackerStatus::Failing,
+                    },
+                    message: status.message,
+                    peers: status.peers.min(u32::MAX as usize) as u32,
+                    seeds: status.seeders,
+                    leechers: status.leechers,
+                    updated: status.last_announce.map(unix),
+                }
+            })
+            .collect()
+    }
+
+    /// Takes trackers that never answered off torrents that are not private, while others answer, so a lost connection never empties them.
+    async fn prune_dead_trackers(&self) {
+        if self.inner.pruning.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let session = self.session();
+        let now = std::time::SystemTime::now();
+        let mut online = false;
+        let mut dead: Vec<(Id, Vec<String>)> = Vec::new();
+        for handle in self.handles() {
+            let statuses = session.tracker_status(handle.info_hash());
+            online |= statuses
+                .values()
+                .any(|status| within(status.last_success, now, DEAD_AFTER));
+            if is_private(&handle) {
+                continue;
+            }
+            let gone: Vec<String> = statuses
+                .iter()
+                .filter(|(_, status)| is_dead(status, now))
+                .map(|(url, _)| url.to_string())
+                .collect();
+            if !gone.is_empty() {
+                dead.push((handle.info_hash().as_string(), gone));
+            }
+        }
+        drop(session);
+        if online {
+            for (id, gone) in dead {
+                let Ok(handle) = self.handle(&id) else {
+                    continue;
+                };
+                let kept: Vec<String> = trackers_of(&handle)
+                    .into_iter()
+                    .filter(|url| !gone.contains(url))
+                    .collect();
+                drop(handle);
+                match self.reload(&id, kept, true).await {
+                    Ok(()) => tracing::info!("took {} dead trackers off {id}", gone.len()),
+                    Err(err) => tracing::warn!("cannot take dead trackers off {id}: {err:#}"),
+                }
+            }
+        }
+        self.inner.pruning.store(false, Ordering::Release);
     }
 
     fn peers(&self, id: &str, api: &Api, key: TorrentIdOrHash) -> Vec<Peer> {
@@ -1139,6 +1372,10 @@ impl Core {
             return Vec::new();
         };
         let now = Instant::now();
+        let countries = self
+            .settings()
+            .peer_countries
+            .then_some(&self.inner.countries);
         let mut live = lock(&self.inner.live);
         let mut peers: Vec<Peer> = snapshot
             .peers
@@ -1159,6 +1396,7 @@ impl Core {
                 };
                 live.peer_bytes.insert(key, (fetched, uploaded, now));
                 Peer {
+                    country: countries.and_then(|countries| countries.of(&addr)),
                     addr,
                     client: stats.client_name,
                     transport: stats
@@ -1212,6 +1450,11 @@ impl Core {
         }
         self.apply_schedule_and_limits(&settings);
         self.scan_watch_dir(&settings).await;
+        let ticks = lock(&self.inner.live).ticks;
+        if settings.trackers.remove_dead && ticks > 0 && ticks.is_multiple_of(PRUNE_TICKS) {
+            let core = self.clone();
+            tokio::spawn(async move { core.prune_dead_trackers().await });
+        }
 
         let pending: Vec<Torrent> = lock(&self.inner.pending)
             .iter()
@@ -1489,6 +1732,7 @@ impl Core {
                 paused: None,
                 files: None,
                 skip_check: false,
+                remember_path: false,
             };
             let mut done = path.clone().into_os_string();
             match Box::pin(self.add(request)).await {
@@ -1606,6 +1850,51 @@ fn peer_id() -> Id20 {
         *slot = ALPHABET[byte as usize % ALPHABET.len()];
     }
     Id20::new(id)
+}
+
+fn download_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(8))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .user_agent(format!("bawkbit/{}", crate::VERSION))
+        .build()
+        .expect("the HTTP client builds")
+}
+
+fn trackers_of(handle: &Handle) -> Vec<String> {
+    handle
+        .shared()
+        .trackers
+        .iter()
+        .map(|url| url.to_string())
+        .collect()
+}
+
+fn is_private(handle: &Handle) -> bool {
+    handle
+        .with_metadata(|meta| meta.info.info().private)
+        .unwrap_or(false)
+}
+
+fn within(at: Option<std::time::SystemTime>, now: std::time::SystemTime, span: Duration) -> bool {
+    at.and_then(|at| now.duration_since(at).ok())
+        .is_some_and(|age| age < span)
+}
+
+/// Failing for a while and never answered since the torrent started; one that answered before may only be down.
+fn is_dead(status: &librqbit::TrackerStatus, now: std::time::SystemTime) -> bool {
+    status.state == librqbit::TrackerState::Failing
+        && status.last_success.is_none()
+        && status.failures >= DEAD_FAILURES
+        && status.failing_since.is_some()
+        && !within(status.failing_since, now, DEAD_AFTER)
+}
+
+fn unix(at: std::time::SystemTime) -> i64 {
+    at.duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
 }
 
 fn is_web_link(link: &str) -> bool {
@@ -1893,11 +2182,8 @@ fn fill_placeholders(word: &str, values: &[(char, String)]) -> String {
 fn clean_trackers(trackers: Vec<String>) -> Result<Vec<String>> {
     let mut clean: Vec<String> = Vec::new();
     for tracker in trackers.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
-        let url = reqwest::Url::parse(tracker)
-            .ok()
-            .filter(|url| matches!(url.scheme(), "http" | "https" | "udp") && url.has_host())
-            .ok_or_else(|| anyhow!("{tracker} is not a tracker address"))?
-            .to_string();
+        let url = trackers::normalize(tracker)
+            .ok_or_else(|| anyhow!("{tracker} is not a tracker address"))?;
         if !clean.contains(&url) {
             clean.push(url);
         }
@@ -2093,6 +2379,7 @@ mod tests {
             download_dir: downloads.to_string_lossy().into_owned(),
             dht: false,
             upnp: false,
+            peer_countries: false,
             ..Settings::default()
         };
         settings.save(&home.join("settings.json")).unwrap();
@@ -2185,11 +2472,95 @@ mod tests {
             dht: false,
             upnp: false,
             listen_port: 0,
+            peer_countries: false,
             ..Settings::default()
         };
         tweak(&mut settings);
         settings.save(&home.join("settings.json")).unwrap();
         Core::start(home.to_path_buf()).await.unwrap()
+    }
+
+    #[test]
+    fn only_trackers_that_never_answered_for_an_hour_count_as_dead() {
+        let now = std::time::SystemTime::now();
+        let ago = |minutes: u64| Some(now - Duration::from_secs(minutes * 60));
+        let failing = librqbit::TrackerStatus {
+            state: librqbit::TrackerState::Failing,
+            failures: 5,
+            failing_since: ago(61),
+            ..Default::default()
+        };
+        assert!(is_dead(&failing, now));
+        let recent = librqbit::TrackerStatus {
+            failing_since: ago(30),
+            ..failing.clone()
+        };
+        assert!(!is_dead(&recent, now));
+        let answered_once = librqbit::TrackerStatus {
+            last_success: ago(120),
+            ..failing.clone()
+        };
+        assert!(!is_dead(&answered_once, now));
+        let few_tries = librqbit::TrackerStatus {
+            failures: 2,
+            ..failing.clone()
+        };
+        assert!(!is_dead(&few_tries, now));
+        assert!(!is_dead(&librqbit::TrackerStatus::default(), now));
+    }
+
+    fn announced(bytes: &[u8]) -> Vec<String> {
+        librqbit::torrent_from_bytes(bytes)
+            .unwrap()
+            .iter_announce()
+            .map(|t| String::from_utf8_lossy(t.as_ref()).into_owned())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_trackers_go_on_public_torrents_only_and_the_picked_folder_is_offered_next() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let downloads = root.path().join("downloads");
+        std::fs::create_dir_all(&home).unwrap();
+        let list = "https://lists.example/best.txt".to_string();
+        let listed = "udp://listed.example:1337/announce";
+        let cache = serde_json::json!({ "lists": { &list: [listed] }, "fetched": crate::now() });
+        std::fs::write(home.join("tracker-lists.json"), cache.to_string()).unwrap();
+        let core = start_core(&home, &downloads, |settings| {
+            settings.trackers.add_from_lists = true;
+            settings.trackers.lists = vec![list.clone()];
+        })
+        .await;
+
+        let own = vec!["http://own.example/announce".to_string()];
+        let public = b"d6:lengthi3e4:name1:a12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaae";
+        let private = b"d6:lengthi3e4:name1:b12:piece lengthi16384e6:pieces20:aaaaaaaaaaaaaaaaaaaa7:privatei1ee";
+        let settings = core.settings();
+        let with = |info: &[u8]| {
+            let bytes = Bytes::from(torrent_file(info, &own));
+            announced(&core.with_list_trackers(bytes, &settings))
+        };
+        assert_eq!(with(public), [own[0].as_str(), listed]);
+        assert_eq!(with(private), own);
+
+        let (folder, bytes) = shared_file(root.path(), "picked").await;
+        let preview = core.preview(Source::File(bytes)).await.unwrap();
+        assert_eq!(preview.save_path, settings.download_dir);
+        let mut request = AddRequest::link("");
+        request.source = Source::Resolved(preview.id);
+        request.save_path = Some(folder.to_string_lossy().into_owned());
+        request.remember_path = true;
+        let id = core.add(request).await.unwrap();
+        let details = core.details(&id).unwrap();
+        assert_eq!(details.trackers, [listed]);
+        assert_eq!(details.tracker_reports[0].url, listed);
+        assert!(!details.private);
+
+        let (_, other) = shared_file(root.path(), "next").await;
+        let preview = core.preview(Source::File(other)).await.unwrap();
+        assert_eq!(Path::new(&preview.save_path), folder);
+        core.shutdown().await;
     }
 
     async fn add_file(core: &Core, bytes: Vec<u8>, save: &Path, skip_check: bool) -> Id {

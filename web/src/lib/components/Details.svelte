@@ -9,7 +9,7 @@
   import Users from '@lucide/svelte/icons/users'
   import X from '@lucide/svelte/icons/x'
   import type { Component } from 'svelte'
-  import { api, type Details } from '$lib/api'
+  import { api, type Details, type TrackerReport } from '$lib/api'
   import { bytes, count, date, eta, percent, ratio, speed, splitPath } from '$lib/format'
   import { app, type DetailsTab } from '$lib/state.svelte'
   import { isRunning, looks } from '$lib/states'
@@ -123,6 +123,42 @@
     trackerBusy = true
     if (await app.removeTracker(id, url, shown.trackers)) await refresh(id)
     trackerBusy = false
+  }
+
+  async function addListTrackers(): Promise<void> {
+    if (!shown || trackerBusy) return
+    const id = shown.id
+    trackerBusy = true
+    if (await app.act({ action: 'add_list_trackers', ids: [id] })) await refresh(id)
+    trackerBusy = false
+  }
+
+  const regions = typeof Intl.DisplayNames === 'function' ? new Intl.DisplayNames(undefined, { type: 'region' }) : null
+
+  function countryName(code: string): string {
+    try {
+      return regions?.of(code) ?? code
+    } catch {
+      return code
+    }
+  }
+
+  function ago(unix: number): string {
+    const minutes = Math.max(1, Math.round((Date.now() / 1000 - unix) / 60))
+    if (minutes < 60) return `${minutes}m ago`
+    if (minutes < 60 * 48) return `${Math.round(minutes / 60)}h ago`
+    return `${Math.round(minutes / 1440)}d ago`
+  }
+
+  /** The one-word state and the rest of what a tracker last said. */
+  function trackerSaid(report: TrackerReport | undefined): { label: string; text: string } {
+    if (!report || report.status === 'waiting') return { label: 'waiting', text: 'not asked yet' }
+    const when = report.updated ? ` · ${ago(report.updated)}` : ''
+    if (report.status === 'working') {
+      const swarm = report.seeds !== null && report.leechers !== null ? `${report.seeds} seeds · ${report.leechers} leechers` : `${report.peers} peers`
+      return { label: 'working', text: swarm + when }
+    }
+    return { label: 'failing', text: (report.message ?? 'no answer') + when }
   }
 
   function trackerKeys(event: KeyboardEvent): void {
@@ -274,7 +310,11 @@
             <div class="table peers">
               {#each shown.peers as peer (peer.addr)}
                 <div class="tr">
-                  <span class="truncate num selectable">{peer.addr}</span>
+                  <span class="truncate num selectable">
+                    {#if peer.country}
+                      <img class="flag" src="/flags/{peer.country}.svg" alt={peer.country} title={countryName(peer.country)} width="16" height="11" onerror={(e) => ((e.currentTarget as HTMLImageElement).hidden = true)} />
+                    {/if}{peer.addr}
+                  </span>
                   <span class="truncate muted">{peer.client ?? ''}</span>
                   <span class="r num d">{speed(peer.down)}</span>
                   <span class="r num u">{speed(peer.up)}</span>
@@ -291,8 +331,14 @@
         {:else}
           <div class="table trackers">
             {#each shown.trackers as url (url)}
+              {@const report = shown.tracker_reports?.find((r) => r.url === url)}
+              {@const said = trackerSaid(report)}
               <div class="tr">
-                <span class="truncate selectable">{url}</span>
+                <span class={['dot', report?.status ?? 'waiting']} title={said.label}></span>
+                <span class="tracker">
+                  <span class="truncate selectable">{url}</span>
+                  <span class={['truncate', 'said', report?.status ?? 'waiting']} title={said.text}>{said.label} · {said.text}</span>
+                </span>
                 <button type="button" class="btn ghost small icon" aria-label="copy tracker" title="copy" onclick={() => app.copy(url, 'tracker')}><Copy /></button>
                 <button type="button" class="btn ghost small icon" aria-label="remove tracker {url}" title="remove" disabled={trackerBusy} onclick={() => removeTracker(url)}><X /></button>
               </div>
@@ -311,6 +357,14 @@
           ></textarea>
           <button type="submit" class="btn small" disabled={trackerBusy || !trackerText.trim()}>add</button>
         </form>
+        <p class="muted pad list-trackers">
+          {#if shown.private}
+            private torrent: public trackers stay off it.
+          {:else}
+            <button type="button" class="btn small" disabled={trackerBusy} onclick={addListTrackers}>add public trackers</button>
+            <span>from the lists under settings, trackers.</span>
+          {/if}
+        </p>
       {/if}
     </div>
   </aside>
@@ -497,9 +551,50 @@
   .peers .tr {
     grid-template-columns: minmax(150px, 1.1fr) minmax(0, 1.3fr) 84px 84px 76px 44px;
   }
+  .flag {
+    display: inline-block;
+    margin-right: 8px;
+    vertical-align: -1px;
+    border-radius: 2px;
+  }
   .trackers .tr {
-    grid-template-columns: minmax(0, 1fr) 24px 24px;
-    gap: 6px;
+    grid-template-columns: 8px minmax(0, 1fr) 24px 24px;
+    gap: 6px 10px;
+    padding-block: 6px;
+  }
+  .tracker {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .said {
+    color: var(--text-weaker);
+    font-size: 12px;
+  }
+  .said.working {
+    color: var(--success);
+  }
+  .said.failing {
+    color: var(--danger);
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-weaker);
+  }
+  .dot.working {
+    background: var(--success);
+  }
+  .dot.failing {
+    background: var(--danger);
+  }
+  .list-trackers {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding-top: 0;
   }
   .add-trackers {
     display: flex;

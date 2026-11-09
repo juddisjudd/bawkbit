@@ -53,8 +53,16 @@
           label: 'remove category',
           danger: true,
           action: () => {
-            if (app.category === name) app.filterBy('all')
-            void app.act({ action: 'remove_category', name })
+            const count = app.torrents.filter((t) => t.category === name).length
+            app.confirm = {
+              message: `remove the category ${name}? ${count === 1 ? 'its torrent stays' : `its ${count} torrents stay`}, with no category.`,
+              confirm: 'remove',
+              danger: true,
+              run: () => {
+                if (app.category === name) app.filterBy('all')
+                void app.act({ action: 'remove_category', name })
+              }
+            }
           }
         }
       ]
@@ -72,8 +80,16 @@
           label: 'remove tag',
           danger: true,
           action: () => {
-            if (app.tag === tag) app.filterBy('all')
-            void app.act({ action: 'remove_tag', tag })
+            const count = app.torrents.filter((t) => t.tags.includes(tag)).length
+            app.confirm = {
+              message: `remove the tag ${tag}? ${count === 1 ? 'one torrent loses it' : `${count} torrents lose it`}.`,
+              confirm: 'remove',
+              danger: true,
+              run: () => {
+                if (app.tag === tag) app.filterBy('all')
+                void app.act({ action: 'remove_tag', tag })
+              }
+            }
           }
         }
       ]

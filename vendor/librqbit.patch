@@ -1,6 +1,17 @@
+diff -ru a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-11-08 21:40:11.174839100 -0800
++++ b/src/lib.rs	2026-11-08 21:40:11.340903600 -0800
+@@ -100,6 +100,7 @@
+     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
+     TorrentStatsState,
+ };
++pub use tracker_comms::{TrackerState, TrackerStatus};
+ pub use type_aliases::FileInfos;
+ 
+ pub use buffers::*;
 diff -ru a/src/limits.rs b/src/limits.rs
---- a/src/limits.rs	2026-11-03 19:14:52.910227900 -0800
-+++ b/src/limits.rs	2026-11-03 19:14:53.196171900 -0800
+--- a/src/limits.rs	2026-11-08 21:40:10.943445800 -0800
++++ b/src/limits.rs	2026-11-08 21:40:11.338905000 -0800
 @@ -12,6 +12,9 @@
      pub download_bps: Option<NonZeroU32>,
  }
@@ -22,8 +33,8 @@ diff -ru a/src/limits.rs b/src/limits.rs
  
      fn new(bps: Option<NonZeroU32>) -> Self {
 diff -ru a/src/session.rs b/src/session.rs
---- a/src/session.rs	2026-11-03 19:14:52.736902700 -0800
-+++ b/src/session.rs	2026-11-03 19:14:53.196171900 -0800
+--- a/src/session.rs	2026-11-08 21:40:10.780627700 -0800
++++ b/src/session.rs	2026-11-08 21:40:11.339904300 -0800
 @@ -6,7 +6,7 @@
      path::{Component, Path, PathBuf},
      sync::{
@@ -33,7 +44,32 @@ diff -ru a/src/session.rs b/src/session.rs
      },
      time::Duration,
  };
-@@ -1366,12 +1366,15 @@
+@@ -70,7 +70,7 @@
+ use tokio::sync::Notify;
+ use tokio_util::sync::{CancellationToken, DropGuard};
+ use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
+-use tracker_comms::{TrackerComms, UdpTrackerClient};
++use tracker_comms::{TrackerComms, TrackerStatus, TrackerStatuses, UdpTrackerClient};
+ 
+ pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
+ 
+@@ -120,6 +120,7 @@
+     reqwest_client: reqwest::Client,
+     udp_tracker_client: UdpTrackerClient,
+     disable_trackers: bool,
++    tracker_status: RwLock<HashMap<Id20, TrackerStatuses>>,
+ 
+     // Lifecycle management
+     cancellation_token: CancellationToken,
+@@ -807,6 +808,7 @@
+                     opts.concurrent_init_limit.unwrap_or(3),
+                 )),
+                 udp_tracker_client,
++                tracker_status: Default::default(),
+                 ratelimits: Limits::new(opts.ratelimits),
+                 ipv4_only: opts.ipv4_only,
+                 trackers: opts.trackers,
+@@ -1366,12 +1368,15 @@
                      peer_max_request_window: peer_opts.max_request_window,
                      allow_overwrite: opts.overwrite,
                      output_folder,
@@ -51,9 +87,46 @@ diff -ru a/src/session.rs b/src/session.rs
                  connector: self.connector.clone(),
                  session: Arc::downgrade(self),
                  magnet_name: name,
+@@ -1462,6 +1467,8 @@
+             debug!("error pausing torrent before deletion: {e:#}")
+         }
+ 
++        self.tracker_status.write().remove(&removed.info_hash());
++
+         let metadata = removed.metadata.load_full().expect("TODO");
+ 
+         let storage = removed
+@@ -1522,6 +1529,15 @@
+         Ok(())
+     }
+ 
++    /// What each tracker of a torrent said the last time it announced.
++    pub fn tracker_status(&self, info_hash: Id20) -> HashMap<url::Url, TrackerStatus> {
++        self.tracker_status
++            .read()
++            .get(&info_hash)
++            .map(|status| status.read().clone())
++            .unwrap_or_default()
++    }
++
+     pub fn make_peer_rx_managed_torrent(
+         self: &Arc<Self>,
+         t: &Arc<ManagedTorrent>,
+@@ -1591,6 +1607,11 @@
+             self.announce_port().unwrap_or(4240),
+             self.reqwest_client.clone(),
+             self.udp_tracker_client.clone(),
++            self.tracker_status
++                .write()
++                .entry(info_hash)
++                .or_default()
++                .clone(),
+         );
+ 
+         let initial_peers_rx = if initial_peers.is_empty() {
 diff -ru a/src/torrent_state/live/mod.rs b/src/torrent_state/live/mod.rs
---- a/src/torrent_state/live/mod.rs	2026-11-03 19:14:52.980744700 -0800
-+++ b/src/torrent_state/live/mod.rs	2026-11-03 19:14:53.181090500 -0800
+--- a/src/torrent_state/live/mod.rs	2026-11-08 21:40:11.029199300 -0800
++++ b/src/torrent_state/live/mod.rs	2026-11-08 21:40:11.311823700 -0800
 @@ -213,7 +213,7 @@
          tokio::sync::mpsc::UnboundedSender<WriterRequest>,
          ChunkInfo,
@@ -103,8 +176,8 @@ diff -ru a/src/torrent_state/live/mod.rs b/src/torrent_state/live/mod.rs
                      session
                          .ratelimits
 diff -ru a/src/torrent_state/mod.rs b/src/torrent_state/mod.rs
---- a/src/torrent_state/mod.rs	2026-11-03 19:14:52.980744700 -0800
-+++ b/src/torrent_state/mod.rs	2026-11-03 19:14:53.183596100 -0800
+--- a/src/torrent_state/mod.rs	2026-11-08 21:40:11.038721300 -0800
++++ b/src/torrent_state/mod.rs	2026-11-08 21:40:11.318187800 -0800
 @@ -10,7 +10,7 @@
  use std::path::{Path, PathBuf};
  use std::sync::Arc;

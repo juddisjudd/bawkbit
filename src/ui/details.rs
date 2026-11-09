@@ -1,11 +1,12 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use bawkbit_core::{Action, Details, Id, Torrent};
+use bawkbit_core::{Action, Details, Id, Torrent, TrackerReport, TrackerStatus};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     Disableable, Icon, Sizable, VirtualListScrollHandle, WindowExt, v_virtual_list,
 };
@@ -455,12 +456,15 @@ impl DetailsView {
         if peers.is_empty() {
             return placeholder("no peers connected", p);
         }
+        let countries = peers.iter().any(|peer| peer.country.is_some());
         div()
             .id("peers")
             .size_full()
             .overflow_y_scroll()
             .text_size(px(12.))
             .children(peers.into_iter().map(|peer| {
+                let country = peer.country.clone().unwrap_or_default();
+                let flag = crate::assets::flag(&country);
                 div()
                     .h(px(28.))
                     .px_4()
@@ -469,6 +473,27 @@ impl DetailsView {
                     .gap_3()
                     .border_b_1()
                     .border_color(p.border_weak)
+                    .when(countries, |row| {
+                        row.child(
+                            div()
+                                .w(px(44.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .text_color(p.text_weak)
+                                .child(match flag {
+                                    Some(path) => img(path)
+                                        .w(px(18.))
+                                        .h(px(12.))
+                                        .flex_none()
+                                        .rounded(px(2.))
+                                        .into_any_element(),
+                                    None => div().w(px(18.)).flex_none().into_any_element(),
+                                })
+                                .child(country),
+                        )
+                    })
                     .child(
                         kit::truncate(peer.addr)
                             .w(px(220.))
@@ -527,6 +552,7 @@ impl DetailsView {
             details.id.clone(),
             details.trackers.clone(),
         );
+        let reports = details.tracker_reports.clone();
         let list: AnyElement = if trackers.is_empty() {
             placeholder("no trackers: peers come from DHT", p)
         } else {
@@ -540,15 +566,34 @@ impl DetailsView {
                     let rest: Vec<String> =
                         trackers.iter().filter(|t| *t != url).cloned().collect();
                     let (engine, id) = (engine.clone(), id.clone());
+                    let report = reports.iter().find(|r| &r.url == url).cloned();
+                    let (color, label, detail) = tracker_state(report.as_ref(), p);
                     div()
-                        .h(px(26.))
+                        .h(px(28.))
                         .pl_4()
                         .pr_2()
                         .flex()
                         .items_center()
-                        .gap_2()
+                        .gap_3()
                         .text_color(p.text)
+                        .child(kit::dot(color))
                         .child(kit::truncate(url.clone()).flex_1())
+                        .child(div().w(px(56.)).flex_none().text_color(color).child(label))
+                        .child(
+                            div()
+                                .id(("tracker-detail", ix))
+                                .w(px(240.))
+                                .flex_none()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_color(p.text_weak)
+                                .child(detail.clone())
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(detail.clone()).build(window, cx)
+                                }),
+                        )
                         .child(
                             kit::button(("remove-tracker", ix), cx)
                                 .xsmall()
@@ -565,23 +610,82 @@ impl DetailsView {
                 }))
                 .into_any_element()
         };
+        let private = details.private;
+        let (list_engine, list_id) = (engine.clone(), id.clone());
         div()
             .size_full()
             .flex()
             .flex_col()
             .child(div().flex_1().min_h_0().child(list))
             .child(
-                div().px_4().py_2().flex().child(
-                    kit::button("add-trackers", cx)
-                        .small()
-                        .icon(Icon::new(IconName::ListPlus))
-                        .label("add trackers")
-                        .on_click(move |_, window, cx| {
-                            prompts::add_trackers(engine.clone(), id.clone(), window, cx)
-                        }),
-                ),
+                div()
+                    .px_4()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        kit::button("add-trackers", cx)
+                            .small()
+                            .icon(Icon::new(IconName::ListPlus))
+                            .label("add trackers")
+                            .on_click(move |_, window, cx| {
+                                prompts::add_trackers(engine.clone(), id.clone(), window, cx)
+                            }),
+                    )
+                    .when(!private, |this| {
+                        this.child(
+                            kit::button("add-list-trackers", cx)
+                                .small()
+                                .icon(Icon::new(IconName::Globe))
+                                .label("add public trackers")
+                                .tooltip("from the lists under settings, trackers")
+                                .on_click(move |_, window, cx| {
+                                    let action = Action::AddListTrackers {
+                                        ids: vec![list_id.clone()],
+                                    };
+                                    run_action(&list_engine, action, window, cx);
+                                }),
+                        )
+                    })
+                    .when(private, |this| {
+                        this.child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(p.text_weaker)
+                                .child("private torrent: public trackers stay off it."),
+                        )
+                    }),
             )
             .into_any_element()
+    }
+}
+
+/// The dot color, the one-word state and the rest of what a tracker last said.
+fn tracker_state(
+    report: Option<&TrackerReport>,
+    p: &Palette,
+) -> (Hsla, &'static str, SharedString) {
+    let Some(report) = report else {
+        return (p.text_weaker, "waiting", "not asked yet".into());
+    };
+    let when = report
+        .updated
+        .map(|at| format!(" · {} ago", format::age(Some(at), bawkbit_core::now())))
+        .unwrap_or_default();
+    match report.status {
+        TrackerStatus::Waiting => (p.text_weaker, "waiting", "not asked yet".into()),
+        TrackerStatus::Working => {
+            let swarm = match (report.seeds, report.leechers) {
+                (Some(seeds), Some(leechers)) => format!("{seeds} seeds · {leechers} leechers"),
+                _ => format!("{} peers", report.peers),
+            };
+            (p.green, "working", format!("{swarm}{when}").into())
+        }
+        TrackerStatus::Failing => {
+            let message = report.message.clone().unwrap_or_else(|| "no answer".into());
+            (p.danger, "failing", format!("{message}{when}").into())
+        }
     }
 }
 

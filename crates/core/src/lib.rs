@@ -1,10 +1,12 @@
 pub mod api;
 mod engine;
+mod geoip;
 mod magnet;
 mod rss;
 mod search;
 pub mod settings;
 mod store;
+pub mod trackers;
 
 use std::path::PathBuf;
 

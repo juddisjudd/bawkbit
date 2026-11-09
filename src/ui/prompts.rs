@@ -6,8 +6,10 @@ use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{Icon, WindowExt};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use super::chrome::run_action;
 use super::kit;
 use crate::engine::Engine;
 use crate::format;
@@ -57,6 +59,160 @@ fn footer(
                 .label(label)
                 .on_click(move |_, window, cx| save(window, cx)),
         )
+}
+
+type Run = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// One button of a confirm dialog.
+pub struct Choice {
+    label: SharedString,
+    danger: bool,
+    run: Run,
+}
+
+impl Choice {
+    pub fn new(
+        label: impl Into<SharedString>,
+        run: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            danger: false,
+            run: Rc::new(run),
+        }
+    }
+
+    pub fn danger(mut self) -> Self {
+        self.danger = true;
+        self
+    }
+}
+
+/// Asks before something that cannot be undone; Enter picks `main`, Escape cancels, and `other` is a second way to go ahead.
+pub fn confirm(
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+    main: Choice,
+    other: Option<Choice>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (title, body) = (title.into(), body.into());
+    let (main, other) = (Rc::new(main), other.map(Rc::new));
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let run = main.run.clone();
+        let main_button = Button::new("confirm-main")
+            .label(main.label.clone())
+            .when(main.danger, |button| button.danger())
+            .when(!main.danger, |button| button.primary())
+            .on_click({
+                let run = main.run.clone();
+                move |_, window, cx| {
+                    window.close_dialog(cx);
+                    run(window, cx);
+                }
+            });
+        let other_button = other.as_ref().map(|other| {
+            let run = other.run.clone();
+            let button = if other.danger {
+                kit::danger_button("confirm-other", cx)
+            } else {
+                kit::button("confirm-other", cx)
+            };
+            button
+                .label(other.label.clone())
+                .on_click(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    run(window, cx);
+                })
+        });
+        dialog
+            .w(px(440.))
+            .title(title.clone())
+            .child(
+                div()
+                    .text_color(crate::theme::palette(cx).text)
+                    .child(body.clone()),
+            )
+            .on_ok(move |_, window, cx| {
+                run(window, cx);
+                true
+            })
+            .footer(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        kit::button("confirm-cancel", cx)
+                            .label("cancel")
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .children(other_button)
+                    .child(main_button),
+            )
+    });
+}
+
+/// Asks before an action that removes something, then runs it.
+pub fn confirm_action(
+    engine: Entity<Engine>,
+    title: impl Into<SharedString>,
+    body: impl Into<SharedString>,
+    action: Action,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let remove = Choice::new("remove", move |window, cx| {
+        run_action(&engine, action.clone(), window, cx)
+    })
+    .danger();
+    confirm(title, body, remove, None, window, cx);
+}
+
+/// Asks before removing torrents; deleting their files is the red choice, and the one Enter picks when `delete_files` is set.
+pub fn remove_torrents(
+    engine: Entity<Engine>,
+    ids: Vec<Id>,
+    delete_files: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    let names: Vec<String> = engine
+        .read(cx)
+        .snapshot
+        .torrents
+        .iter()
+        .filter(|t| ids.contains(&t.id))
+        .map(|t| t.name.clone())
+        .collect();
+    let what = match names.as_slice() {
+        [one] => one.clone(),
+        _ => format!("{} torrents", ids.len()),
+    };
+    let remove = |engine: Entity<Engine>, ids: Vec<Id>, delete_files: bool| {
+        move |window: &mut Window, cx: &mut App| {
+            let action = Action::Remove {
+                ids: ids.clone(),
+                delete_files,
+            };
+            run_action(&engine, action, window, cx);
+        }
+    };
+    let delete = Choice::new("delete files", remove(engine.clone(), ids.clone(), true)).danger();
+    if delete_files {
+        let title = format!("delete {what} and the downloaded files?");
+        let body = "the files go from your disk too. this cannot be undone.";
+        confirm(title, body, delete, None, window, cx);
+    } else {
+        let title = format!("remove {what}?");
+        let body = "the downloaded files stay on your disk.";
+        let keep = Choice::new("remove", remove(engine, ids, false));
+        confirm(title, body, keep, Some(delete), window, cx);
+    }
 }
 
 /// Adds trackers to one torrent; it keeps its pieces and carries on.

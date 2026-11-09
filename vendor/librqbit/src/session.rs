@@ -70,7 +70,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 use tokio_util::sync::{CancellationToken, DropGuard};
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
-use tracker_comms::{TrackerComms, UdpTrackerClient};
+use tracker_comms::{TrackerComms, TrackerStatus, TrackerStatuses, UdpTrackerClient};
 
 pub const SUPPORTED_SCHEMES: [&str; 3] = ["http:", "https:", "magnet:"];
 
@@ -120,6 +120,7 @@ pub struct Session {
     reqwest_client: reqwest::Client,
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
+    tracker_status: RwLock<HashMap<Id20, TrackerStatuses>>,
 
     // Lifecycle management
     cancellation_token: CancellationToken,
@@ -807,6 +808,7 @@ impl Session {
                     opts.concurrent_init_limit.unwrap_or(3),
                 )),
                 udp_tracker_client,
+                tracker_status: Default::default(),
                 ratelimits: Limits::new(opts.ratelimits),
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
@@ -1465,6 +1467,8 @@ impl Session {
             debug!("error pausing torrent before deletion: {e:#}")
         }
 
+        self.tracker_status.write().remove(&removed.info_hash());
+
         let metadata = removed.metadata.load_full().expect("TODO");
 
         let storage = removed
@@ -1523,6 +1527,15 @@ impl Session {
 
         info!(id, "deleted torrent");
         Ok(())
+    }
+
+    /// What each tracker of a torrent said the last time it announced.
+    pub fn tracker_status(&self, info_hash: Id20) -> HashMap<url::Url, TrackerStatus> {
+        self.tracker_status
+            .read()
+            .get(&info_hash)
+            .map(|status| status.read().clone())
+            .unwrap_or_default()
     }
 
     pub fn make_peer_rx_managed_torrent(
@@ -1594,6 +1607,11 @@ impl Session {
             self.announce_port().unwrap_or(4240),
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
+            self.tracker_status
+                .write()
+                .entry(info_hash)
+                .or_default()
+                .clone(),
         );
 
         let initial_peers_rx = if initial_peers.is_empty() {

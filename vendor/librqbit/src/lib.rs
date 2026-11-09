@@ -100,6 +100,7 @@ pub use torrent_state::{
     ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
     TorrentStatsState,
 };
+pub use tracker_comms::{TrackerState, TrackerStatus};
 pub use type_aliases::FileInfos;
 
 pub use buffers::*;

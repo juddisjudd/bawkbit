@@ -96,7 +96,7 @@ export function openTorrentMenu(x: number, y: number): void {
       ...(one ? [{ label: 'details', action: () => app.openDetails(one) }] : []),
       { label: 'copy', items: () => copyItems(ids) },
       'sep',
-      { label: 'remove', action: () => app.remove(ids, false) },
+      { label: 'remove', action: () => app.askRemove(ids) },
       { label: 'remove and delete files', danger: true, action: () => app.remove(ids, true) }
     ]
   }

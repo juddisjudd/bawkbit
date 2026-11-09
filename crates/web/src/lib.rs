@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use bawkbit_core::settings::{Indexer, Settings};
 use bawkbit_core::{
     Action, AddRequest, Backup, Core, Details, Preview, Reply, Rss, RssAction, Rule, RuleMatch,
-    SearchReply, SearchRequest, Snapshot, Source,
+    SearchReply, SearchRequest, Snapshot, Source, TrackerLists,
 };
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
@@ -161,6 +161,10 @@ fn router(state: AppState) -> Router {
         .route("/rss", get(get_rss).post(rss_action))
         .route("/rss/matches", post(rule_matches))
         .route("/backup", get(get_backup).post(restore))
+        .route(
+            "/tracker-lists",
+            get(get_tracker_lists).post(refresh_tracker_lists),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_login));
     let open = Router::new()
         .route("/session", get(session))
@@ -435,6 +439,14 @@ async fn get_backup(State(state): State<AppState>) -> Json<Backup> {
 async fn restore(State(state): State<AppState>, Json(backup): Json<Backup>) -> ApiResult<Reply> {
     state.core.restore(backup).await?;
     Ok(Json(Reply::Done))
+}
+
+async fn get_tracker_lists(State(state): State<AppState>) -> Json<TrackerLists> {
+    Json(state.core.tracker_lists())
+}
+
+async fn refresh_tracker_lists(State(state): State<AppState>) -> Json<TrackerLists> {
+    Json(state.core.refresh_tracker_lists().await)
 }
 
 async fn get_settings(State(state): State<AppState>) -> Json<Settings> {

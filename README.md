@@ -69,6 +69,7 @@ To open magnet links and `.torrent` files from your browser in bawkbit on Window
 - **Add** magnet links, links to `.torrent` files, and `.torrent` files. You see the file list first and pick what to download.
 - **Add magnets straight away**, without the file list: **settings → downloads → add magnets without asking**.
 - **Skip check**: in the add window, trust files that are already complete, such as for cross-seeding. A spot check still runs. If it finds a bad piece, a full check takes over.
+- **The last folder you picked** comes first in the next add window. Pick the download folder again to go back to it.
 - **Watch folder**: put `.torrent` files in it and bawkbit adds them.
 - **One window**: open a magnet link while bawkbit runs, and the open window gets it.
 
@@ -82,7 +83,8 @@ To open magnet links and `.torrent` files from your browser in bawkbit on Window
 - **Categories**, each with its own folder and its own shared speed limits.
 - **Tags**. Right-click a category or tag in the sidebar to rename it.
 - **Filters**: show the list by status, category and tag at the same time.
-- **Details** for each torrent: a piece map, files with progress and on/off per file, peers, and trackers you can add and remove.
+- **Details** for each torrent: a piece map, files with progress and on/off per file, peers with their country flag, and trackers you can add and remove. Each tracker shows whether it works, and why not when it fails.
+- **Asks first** before it removes a torrent, a category, a tag, a feed, a rule or a search source.
 
 ![The details of one torrent: a piece map, its progress, speed, peers and time left](docs/screenshots/details.png)
 
@@ -93,6 +95,7 @@ To open magnet links and `.torrent` files from your browser in bawkbit on Window
 - **Seeding goals**: stop sharing at a ratio or after a set time.
 - **Per torrent**, from the right-click menu: force start past the queue, check again, no upload, its own speed limits, and more trackers. A torrent keeps what it has downloaded when you add trackers.
 - **More ways to connect**: DHT and peer exchange find peers without a tracker. UPnP opens the port on your router for you. uTP is off until you turn it on under **settings → connection**.
+- **Public tracker lists**: turn on **settings → trackers → add public trackers to new torrents**. bawkbit reads [ngosang/trackerslist](https://github.com/ngosang/trackerslist) and [XIU2/TrackersListCollection](https://github.com/XIU2/TrackersListCollection) once a day and adds their trackers to each new torrent, without repeats. Private torrents never get them. The same tab can add them to the torrents you already have, and take off trackers that fail for an hour without one answer.
 
 ### Runs quietly in the background
 
@@ -267,8 +270,10 @@ Act on the selected torrents:
 | Press | To |
 | --- | --- |
 | `Space` | pause or resume them |
-| `Delete` | remove them and keep their files |
-| `Shift+Delete` | remove them and delete their files |
+| `Delete` | ask, then remove them and keep their files |
+| `Shift+Delete` | ask, then remove them and delete their files |
+
+When bawkbit asks first, `Enter` picks the main answer and `Esc` cancels.
 
 Double-click a torrent to open its folder. Right-click it for everything else.
 
@@ -283,6 +288,8 @@ Your downloads go to `Downloads\bawkbit` on Windows and `~/Downloads/bawkbit` on
 | RSS feeds and rules | `%APPDATA%\bawkbit\rss.json` | `~/.config/bawkbit/rss.json` |
 | The torrents themselves, for resuming | `%APPDATA%\bawkbit\session` | `~/.config/bawkbit/session` |
 | Desktop app look and sort order | `%APPDATA%\bawkbit\desktop.json` | `~/.config/bawkbit/desktop.json` |
+| Trackers from the public lists | `%APPDATA%\bawkbit\tracker-lists.json` | `~/.config/bawkbit/tracker-lists.json` |
+| Peer country database | `%APPDATA%\bawkbit\dbip-country-lite.mmdb` | `~/.config/bawkbit/dbip-country-lite.mmdb` |
 
 To keep a second copy's settings apart from your own, set `BAWKBIT_HOME` to a folder.
 
@@ -364,7 +371,7 @@ Read what is going on:
 | --- | --- |
 | `GET /api/snapshot` | every torrent, the speeds, categories and tags |
 | `GET /api/events` | the same snapshot once a second, and a `finished` event for each finished download, as server-sent events |
-| `GET /api/torrents/{id}` | one torrent's files, peers, trackers and piece map |
+| `GET /api/torrents/{id}` | one torrent's files, peers with their country, trackers with what each last said, and piece map |
 
 Add and change torrents:
 
@@ -372,7 +379,7 @@ Add and change torrents:
 | --- | --- |
 | `POST /api/preview` | reads a magnet link or `.torrent` file without adding it |
 | `POST /api/torrents` | adds a torrent; `skip_check` trusts files already on disk |
-| `POST /api/actions` | pause, resume, force start, re-check, remove, set files, trackers, no upload, speed limits, categories and their limits, tags, renames and the alternative limits |
+| `POST /api/actions` | pause, resume, force start, re-check, remove, set files, trackers, public list trackers, no upload, speed limits, categories and their limits, tags, renames and the alternative limits |
 
 Search and RSS:
 
@@ -388,11 +395,14 @@ Settings and backup:
 | Request | Does |
 | --- | --- |
 | `GET` or `PUT /api/settings` | reads or changes the engine settings |
+| `GET` or `POST /api/tracker-lists` | how many trackers the public lists gave and when, or reads the lists again now |
 | `GET` or `POST /api/backup` | exports the settings, categories, tags and RSS, or imports them |
 
 ## Credits
 
-- [librqbit](https://github.com/ikatson/rqbit) (Apache-2.0) is the BitTorrent engine, with the small patch in [`vendor`](vendor).
+- [librqbit](https://github.com/ikatson/rqbit) (Apache-2.0) is the BitTorrent engine, with the small patches in [`vendor`](vendor).
+- [IP geolocation by DB-IP](https://db-ip.com) (CC BY 4.0) gives each peer's country. bawkbit downloads the free country database once a month. Turn it off under **settings → connection → peer countries**.
+- [country-flag-icons](https://github.com/catamphetamine/country-flag-icons) (MIT, `web/public/flags/LICENSE`) draws the flags.
 - [GPUI Kit](https://github.com/longbridge/gpui-kit) (Apache-2.0) and Zed's GPUI draw the desktop app.
 - [axum](https://github.com/tokio-rs/axum) (MIT) serves the web UI. [Svelte](https://svelte.dev) (MIT) builds it.
 - [IBM Plex Mono](https://github.com/IBM/plex) (SIL Open Font License, `assets/fonts/OFL.txt`) is the typeface.

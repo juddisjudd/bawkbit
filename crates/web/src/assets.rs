@@ -19,10 +19,13 @@ fn find(path: &str) -> Option<&'static [u8]> {
 pub async fn serve(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     if let Some(bytes) = (!path.is_empty()).then(|| find(path)).flatten() {
-        let immutable = path.starts_with("assets/");
+        let immutable = path.starts_with("assets/") || path.starts_with("flags/");
         return file(path, bytes, immutable);
     }
-    if path.starts_with("api/") || path.starts_with("assets/") {
+    if ["api/", "assets/", "flags/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
         return StatusCode::NOT_FOUND.into_response();
     }
     match find("index.html") {

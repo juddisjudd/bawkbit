@@ -1,19 +1,19 @@
 use std::collections::HashMap;
 
 use bawkbit_core::settings::{Indexer, IndexerKind};
-use bawkbit_core::{Backup, Settings};
+use bawkbit_core::{Action, Backup, Settings};
 use bawkbit_web::Status as WebStatus;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
-use gpui_kit::component::input::{InputEvent, InputState};
+use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Disableable, Icon, Sizable, WindowExt};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use super::kit;
 use super::updates::{UpdateState, Updates};
+use super::{kit, prompts};
 use crate::autostart;
 use crate::config::Config;
 use crate::engine::Engine;
@@ -24,6 +24,7 @@ use crate::theme::{self, DEFAULT_THEME, Look, Mode, Palette, palette};
 enum Tab {
     Downloads,
     Connection,
+    Trackers,
     Speed,
     Queue,
     Search,
@@ -34,9 +35,10 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: [Tab; 9] = [
+    const ALL: [Tab; 10] = [
         Tab::Downloads,
         Tab::Connection,
+        Tab::Trackers,
         Tab::Speed,
         Tab::Queue,
         Tab::Search,
@@ -50,6 +52,7 @@ impl Tab {
         match self {
             Tab::Downloads => "downloads",
             Tab::Connection => "connection",
+            Tab::Trackers => "trackers",
             Tab::Speed => "speed",
             Tab::Queue => "queue",
             Tab::Search => "search",
@@ -64,6 +67,7 @@ impl Tab {
         match self {
             Tab::Downloads => IconName::FolderDown,
             Tab::Connection => IconName::Network,
+            Tab::Trackers => IconName::Server,
             Tab::Speed => IconName::Gauge,
             Tab::Queue => IconName::Hourglass,
             Tab::Search => IconName::Search,
@@ -115,6 +119,8 @@ pub struct SettingsView {
     errors: HashMap<Field, &'static str>,
     password: Entity<InputState>,
     indexers: Vec<IndexerRow>,
+    tracker_lists: Entity<TextareaState>,
+    reading_lists: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -168,6 +174,21 @@ impl SettingsView {
                 .masked(true)
         });
         subscriptions.push(cx.observe(&updates, |_, _, cx| cx.notify()));
+        let tracker_lists = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 8)
+                .placeholder("list addresses, one per line")
+                .default_value(s.trackers.lists.join("\n"))
+        });
+        subscriptions.push(cx.subscribe_in(
+            &tracker_lists,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Blur) {
+                    this.commit_lists(window, cx);
+                }
+            },
+        ));
         let stored = engine.read(cx).core().settings().indexers;
         let mut this = Self {
             engine,
@@ -181,6 +202,8 @@ impl SettingsView {
             errors: HashMap::new(),
             password,
             indexers: Vec::new(),
+            tracker_lists,
+            reading_lists: false,
             _subscriptions: subscriptions,
         };
         this.indexers = stored
@@ -282,8 +305,25 @@ impl SettingsView {
     }
 
     fn remove_indexer(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.indexers.retain(|row| row.id != id);
-        self.save_indexers(window, cx);
+        let Some(row) = self.indexers.iter().find(|row| row.id == id) else {
+            return;
+        };
+        let name = row.name.read(cx).value().trim().to_string();
+        let name = if name.is_empty() {
+            row.kind.label().to_string()
+        } else {
+            name
+        };
+        let (view, id) = (cx.entity().downgrade(), id.to_string());
+        let remove = prompts::Choice::new("remove", move |window, cx| {
+            let _ = view.update(cx, |this, cx| {
+                this.indexers.retain(|row| row.id != id);
+                this.save_indexers(window, cx);
+            });
+        })
+        .danger();
+        let body = "search stops asking it. its address and key are forgotten.";
+        prompts::confirm(format!("remove {name}?"), body, remove, None, window, cx);
     }
 
     fn test_indexer(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -507,7 +547,95 @@ impl SettingsView {
             .iter()
             .map(|indexer| self.indexer_row(indexer, window, cx))
             .collect();
+        let lists = s.trackers.lists.join("\n");
+        self.tracker_lists
+            .update(cx, |state, cx| state.set_value(lists, window, cx));
         cx.notify();
+    }
+
+    fn typed_lists(&self, cx: &App) -> Vec<String> {
+        self.tracker_lists
+            .read(cx)
+            .value()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    fn commit_lists(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let lists = self.typed_lists(cx);
+        self.toggle(|s| s.trackers.lists = lists, window, cx);
+    }
+
+    fn read_lists(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut settings = self.settings(cx);
+        settings.trackers.lists = self.typed_lists(cx);
+        self.reading_lists = true;
+        let job = self.engine.read(cx).run(|core| async move {
+            core.update_settings(settings).await?;
+            anyhow::Ok(core.refresh_tracker_lists().await)
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = job.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.reading_lists = false;
+                let note = match result {
+                    Ok(lists) if lists.errors.is_empty() => {
+                        Notification::success(format!("{} trackers", lists.trackers))
+                    }
+                    Ok(lists) => Notification::warning(lists.errors.join("\n")),
+                    Err(err) => Notification::error(format!("{err:#}")),
+                };
+                window.push_notification(note, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn add_lists_everywhere(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .engine
+            .read(cx)
+            .snapshot
+            .torrents
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        let engine = self.engine.clone();
+        let add = prompts::Choice::new("add them", move |window, cx| {
+            let action = Action::AddListTrackers { ids: ids.clone() };
+            let job = engine
+                .read(cx)
+                .run(move |core| async move { core.execute(action).await.map(|_| ()) });
+            window
+                .spawn(cx, async move |cx| {
+                    let result = job.await;
+                    let _ = cx.update(|window, cx| {
+                        let note = match result {
+                            Ok(()) => Notification::success("public trackers added"),
+                            Err(err) => Notification::error(format!("{err:#}")),
+                        };
+                        window.push_notification(note, cx);
+                    });
+                })
+                .detach();
+        });
+        let body = "private torrents are skipped. each other torrent drops its peers once and finds them again.";
+        prompts::confirm(
+            "add public trackers to every torrent?",
+            body,
+            add,
+            None,
+            window,
+            cx,
+        );
     }
 
     fn pick_theme(&mut self, id: SharedString, mode: Mode, cx: &mut Context<Self>) {
@@ -710,6 +838,102 @@ impl SettingsView {
                 "peers per torrent",
                 "",
                 self.text(Field::PeerLimit, p),
+                p,
+            ))
+            .child(field(
+                "peer countries",
+                "shows a flag for each peer, from IP geolocation by DB-IP (db-ip.com), downloaded once a month",
+                self.switch(
+                    "peer-countries",
+                    s.peer_countries,
+                    |s, on| s.peer_countries = on,
+                    cx,
+                ),
+                p,
+            ))
+    }
+
+    fn render_trackers(&self, s: &Settings, p: &Palette, cx: &mut Context<Self>) -> Div {
+        let lists = self.engine.read(cx).core().tracker_lists();
+        let read = match lists.fetched {
+            Some(at) => format!(
+                "{} trackers, read {} ago",
+                lists.trackers,
+                format::age(Some(at), bawkbit_core::now())
+            ),
+            None => "not read yet".to_string(),
+        };
+        let has_torrents = !self.engine.read(cx).snapshot.torrents.is_empty();
+        panel()
+            .child(field(
+                "add public trackers to new torrents",
+                "more trackers find more peers. private torrents never get them.",
+                self.switch(
+                    "add-from-lists",
+                    s.trackers.add_from_lists,
+                    |s, on| s.trackers.add_from_lists = on,
+                    cx,
+                ),
+                p,
+            ))
+            .child(field(
+                "tracker lists",
+                "text files with one tracker on each line. repeats are left out.",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(Textarea::new(&self.tracker_lists).w_full())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                kit::button("read-lists", cx)
+                                    .small()
+                                    .icon(Icon::new(IconName::RefreshCw))
+                                    .label("read them now")
+                                    .loading(self.reading_lists)
+                                    .disabled(self.reading_lists)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.read_lists(window, cx)
+                                    })),
+                            )
+                            .child(
+                                kit::button("add-lists-everywhere", cx)
+                                    .small()
+                                    .icon(Icon::new(IconName::ListPlus))
+                                    .label("add to every torrent now")
+                                    .disabled(!has_torrents)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_lists_everywhere(window, cx)
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(p.text_weaker)
+                                    .child(read),
+                            ),
+                    )
+                    .children(lists.errors.into_iter().map(|error| {
+                        div()
+                            .text_size(px(12.))
+                            .text_color(p.danger)
+                            .child(error)
+                    })),
+                p,
+            ))
+            .child(field(
+                "remove dead trackers",
+                "takes a tracker off a torrent after an hour of failing without one answer. never on private torrents.",
+                self.switch(
+                    "remove-dead",
+                    s.trackers.remove_dead,
+                    |s, on| s.trackers.remove_dead = on,
+                    cx,
+                ),
                 p,
             ))
     }
@@ -1547,6 +1771,7 @@ impl Render for SettingsView {
         let body = match self.tab {
             Tab::Downloads => self.render_downloads(&s, &p, cx),
             Tab::Connection => self.render_connection(&s, &p, cx),
+            Tab::Trackers => self.render_trackers(&s, &p, cx),
             Tab::Speed => self.render_speed(&s, &p, cx),
             Tab::Queue => self.render_queue(&p),
             Tab::Search => self.render_search(&p, cx),

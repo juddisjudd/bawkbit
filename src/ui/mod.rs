@@ -241,12 +241,7 @@ impl Workspace {
         if cx.global::<Config>().quick_add && magnet {
             let request = AddRequest {
                 source,
-                save_path: None,
-                category: None,
-                tags: Vec::new(),
-                paused: None,
-                files: None,
-                skip_check: false,
+                ..AddRequest::link(String::new())
             };
             let job = self
                 .engine

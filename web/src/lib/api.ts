@@ -94,6 +94,22 @@ export interface Peer {
   up: number
   downloaded: number
   uploaded: number
+  /** Two capital letters, such as DE, while peer countries are on and known. */
+  country?: string | null
+}
+
+export type TrackerStatus = 'waiting' | 'working' | 'failing'
+
+/** What one tracker said the last time this torrent announced to it. */
+export interface TrackerReport {
+  url: string
+  status: TrackerStatus
+  message: string | null
+  peers: number
+  seeds: number | null
+  leechers: number | null
+  /** Unix seconds of the last answer or failure. */
+  updated: number | null
 }
 
 export interface Details {
@@ -108,6 +124,17 @@ export interface Details {
   files: TorrentFile[]
   peers: Peer[]
   trackers: string[]
+  /** One for each of `trackers`, in the same order. */
+  tracker_reports: TrackerReport[]
+  /** Public tracker lists never go on a private torrent. */
+  private: boolean
+}
+
+/** The public tracker lists under settings, as last read. */
+export interface TrackerLists {
+  trackers: number
+  fetched: number | null
+  errors: string[]
 }
 
 export type Source =
@@ -139,6 +166,8 @@ export interface AddRequest {
   files?: number[] | null
   /** Trusts that the files are complete, so only a spot check runs. */
   skip_check?: boolean
+  /** A person picked `save_path`, so the next add offers it first. */
+  remember_path?: boolean
 }
 
 export type Action =
@@ -158,6 +187,7 @@ export type Action =
   | { action: 'force_start'; ids: Id[] }
   | { action: 'recheck'; ids: Id[] }
   | { action: 'set_trackers'; id: Id; trackers: string[] }
+  | { action: 'add_list_trackers'; ids: Id[] }
   | { action: 'set_no_upload'; ids: Id[]; on: boolean }
   | { action: 'set_limits'; ids: Id[]; down: number; up: number }
   | { action: 'rename_category'; from: string; to: string }
@@ -210,8 +240,19 @@ export interface Settings {
   on_finish: string
   /** Minutes between feed checks; 0 checks only by hand. */
   rss_minutes: number
+  /** Shows each peer's country, from a database downloaded once a month. */
+  peer_countries: boolean
+  trackers: TrackerSettings
   web: Web
   indexers: Indexer[]
+}
+
+export interface TrackerSettings {
+  /** Adds the trackers from `lists` to every new torrent that is not private. */
+  add_from_lists: boolean
+  lists: string[]
+  /** Takes a tracker off a public torrent after an hour of failing without one answer. */
+  remove_dead: boolean
 }
 
 export type IndexerKind = 'prowlarr' | 'jackett'
@@ -421,7 +462,9 @@ export const api = {
   rssAct: (action: RssAction) => request<Rss>('POST', '/rss', action),
   ruleMatches: (rule: Rule) => request<RuleMatch[]>('POST', '/rss/matches', rule),
   backup: () => request<Backup>('GET', '/backup'),
-  restore: (backup: unknown) => request<Reply>('POST', '/backup', backup)
+  restore: (backup: unknown) => request<Reply>('POST', '/backup', backup),
+  trackerLists: () => request<TrackerLists>('GET', '/tracker-lists'),
+  readTrackerLists: () => request<TrackerLists>('POST', '/tracker-lists', {})
 }
 
 export function fileToBase64(file: Blob): Promise<string> {

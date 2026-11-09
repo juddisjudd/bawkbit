@@ -10,10 +10,11 @@
   import Plus from '@lucide/svelte/icons/plus'
   import RssIcon from '@lucide/svelte/icons/rss'
   import Search from '@lucide/svelte/icons/search'
+  import Server from '@lucide/svelte/icons/server'
   import Trash from '@lucide/svelte/icons/trash-2'
   import Upload from '@lucide/svelte/icons/upload'
   import type { Component } from 'svelte'
-  import { api, type Indexer, type IndexerKind, type Settings } from '$lib/api'
+  import { api, type Indexer, type IndexerKind, type Settings, type TrackerLists } from '$lib/api'
   import { limitBytes, limitUnit, limitValue } from '$lib/format'
   import { app, type SettingsTab, type ThemeChoice } from '$lib/state.svelte'
   import Checkbox from './Checkbox.svelte'
@@ -23,6 +24,7 @@
   const tabs: { id: SettingsTab; label: string; icon: Component<{ size?: number }> }[] = [
     { id: 'downloads', label: 'downloads', icon: Download },
     { id: 'connection', label: 'connection', icon: Network },
+    { id: 'trackers', label: 'trackers', icon: Server },
     { id: 'speed', label: 'speed', icon: Gauge },
     { id: 'queue', label: 'queue', icon: ListOrdered },
     { id: 'search', label: 'search', icon: Search },
@@ -154,7 +156,54 @@
     }
   }
 
-  const DEFAULT_URL: Record<IndexerKind, string> = { prowlarr: 'http://localhost:9696', jackett: 'http://localhost:9117' }
+  let lists = $state<TrackerLists | null>(null)
+  let readingLists = $state(false)
+
+  api
+    .trackerLists()
+    .then((info) => (lists = info))
+    .catch(() => {})
+
+  function setLists(text: string): void {
+    const typed = text
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+    save((s) => (s.trackers.lists = typed))
+  }
+
+  async function readLists(): Promise<void> {
+    readingLists = true
+    await queue
+    try {
+      lists = await api.readTrackerLists()
+      show(lists.errors.length ? 'some lists did not answer' : `${lists.trackers} trackers`, lists.errors.length > 0)
+    } catch (err) {
+      show((err as Error).message, true)
+    } finally {
+      readingLists = false
+    }
+  }
+
+  function addListsEverywhere(): void {
+    const ids = app.torrents.map((t) => t.id)
+    app.confirm = {
+      message: 'add public trackers to every torrent? private torrents are skipped. each other torrent drops its peers once and finds them again.',
+      confirm: 'add them',
+      run: async () => {
+        if (await app.act({ action: 'add_list_trackers', ids })) show('public trackers added', false)
+      }
+    }
+  }
+
+  function ago(unix: number): string {
+    const minutes = Math.max(1, Math.round((Date.now() / 1000 - unix) / 60))
+    if (minutes < 60) return `${minutes}m ago`
+    if (minutes < 60 * 48) return `${Math.round(minutes / 60)}h ago`
+    return `${Math.round(minutes / 1440)}d ago`
+  }
+
+  const DEFAULT_URL: Record<IndexerKind, string> ={ prowlarr: 'http://localhost:9696', jackett: 'http://localhost:9117' }
   let tests = $state<Record<string, { text: string; error: boolean; busy: boolean }>>({})
 
   function addIndexer(kind: IndexerKind): void {
@@ -310,10 +359,49 @@
         <Checkbox checked={draft.dht} label="find peers without trackers (DHT)" onchange={(v) => save((s) => (s.dht = v))} />
         <Checkbox checked={draft.utp} label="uTP" onchange={(v) => save((s) => (s.utp = v))} />
         <span class="hint indent">also connect to peers over uTP. the engine still calls it new.</span>
+        <Checkbox checked={draft.peer_countries} label="show peer countries" onchange={(v) => save((s) => (s.peer_countries = v))} />
+        <span class="hint indent"
+          >a flag for each peer, from <a href="https://db-ip.com" target="_blank" rel="noreferrer">IP geolocation by DB-IP</a>. the database downloads once a month.</span
+        >
       </div>
       {#if app.snapshot && !app.snapshot.totals.port}
         <p class="hint warn">bawkbit is not listening for incoming peers. another program may be using the port.</p>
       {/if}
+    {:else if app.settingsTab === 'trackers'}
+      <div class="checks">
+        <Checkbox
+          checked={draft.trackers.add_from_lists}
+          label="add public trackers to new torrents"
+          onchange={(v) => save((s) => (s.trackers.add_from_lists = v))}
+        />
+        <span class="hint indent">more trackers find more peers. private torrents never get them.</span>
+      </div>
+      <div class="field">
+        <label class="label" for="tracker-lists">tracker lists</label>
+        <textarea
+          id="tracker-lists"
+          class="input lists"
+          rows="3"
+          spellcheck="false"
+          placeholder="list addresses, one per line"
+          aria-describedby="lists-hint"
+          value={draft.trackers.lists.join('\n')}
+          onchange={(e) => setLists(e.currentTarget.value)}
+        ></textarea>
+        <span class="hint" id="lists-hint">text files with one tracker on each line. repeats are left out.</span>
+        <div class="inline wrap">
+          <button type="button" class="btn small" disabled={readingLists} onclick={readLists}>{readingLists ? 'reading…' : 'read them now'}</button>
+          <button type="button" class="btn small" disabled={!app.torrents.length} onclick={addListsEverywhere}>add to every torrent now</button>
+          {#if lists}
+            <span class="hint">{lists.fetched ? `${lists.trackers} trackers, read ${ago(lists.fetched)}` : 'not read yet'}</span>
+          {/if}
+        </div>
+        {#each lists?.errors ?? [] as error (error)}<span class="hint error">{error}</span>{/each}
+      </div>
+      <div class="checks">
+        <Checkbox checked={draft.trackers.remove_dead} label="remove dead trackers" onchange={(v) => save((s) => (s.trackers.remove_dead = v))} />
+        <span class="hint indent">takes a tracker off a torrent after an hour of failing without one answer. never on private torrents.</span>
+      </div>
     {:else if app.settingsTab === 'speed'}
       {@render limit('down_limit', 'download')}
       {@render limit('up_limit', 'upload')}
@@ -393,7 +481,10 @@
               class="btn ghost icon"
               aria-label="remove {indexer.name || indexer.kind}"
               title="remove"
-              onclick={() => save((s) => s.indexers.splice(ix, 1))}
+              onclick={() =>
+                risky(`remove ${indexer.name || indexer.kind}? search stops asking it. its address and key are forgotten.`, 'remove', (s) =>
+                  s.indexers.splice(ix, 1)
+                )}
             >
               <Trash />
             </button>
@@ -627,6 +718,17 @@
   }
   .hint.warn {
     color: var(--warning);
+  }
+  .hint.error {
+    color: var(--danger);
+    overflow-wrap: anywhere;
+  }
+  .lists {
+    min-height: 64px;
+    resize: vertical;
+  }
+  .inline.wrap {
+    flex-wrap: wrap;
   }
   .hint.indent {
     margin: -4px 0 0 28px;

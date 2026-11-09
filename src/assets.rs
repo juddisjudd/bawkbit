@@ -73,6 +73,29 @@ pub const FONTS: [&[u8]; 4] = [
 #[cfg(target_os = "linux")]
 pub const SYSTEM_FONT: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf");
 
+mod flags {
+    include!(concat!(env!("OUT_DIR"), "/flags.rs"));
+}
+
+/// The asset path of a country's flag, if bawkbit has one.
+pub fn flag(code: &str) -> Option<SharedString> {
+    flag_svg(code).map(|_| format!("flags/{code}.svg").into())
+}
+
+fn flag_svg(code: &str) -> Option<&'static [u8]> {
+    flags::FLAGS
+        .binary_search_by(|(known, _)| (*known).cmp(code))
+        .ok()
+        .map(|ix| flags::FLAGS[ix].1)
+}
+
+/// GPUI draws an SVG image at the size it states, and the flags state none, so each gets a small one.
+fn sized_flag(svg: &[u8]) -> Vec<u8> {
+    let mut sized = b"<svg width=\"36\" height=\"24\"".to_vec();
+    sized.extend_from_slice(svg.strip_prefix(b"<svg").unwrap_or(svg));
+    sized
+}
+
 pub struct AppAssets;
 
 impl AssetSource for AppAssets {
@@ -81,6 +104,12 @@ impl AssetSource for AppAssets {
             return Ok(Some(Cow::Borrowed(include_bytes!(
                 "../assets/brand/mark.svg"
             ))));
+        }
+        if let Some(code) = path
+            .strip_prefix("flags/")
+            .and_then(|name| name.strip_suffix(".svg"))
+        {
+            return Ok(flag_svg(code).map(|svg| Cow::Owned(sized_flag(svg))));
         }
         if let Some(bytes) = AppIcons.load(path)? {
             return Ok(Some(bytes));

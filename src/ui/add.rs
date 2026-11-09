@@ -196,8 +196,12 @@ impl AddView {
             .find(|c| c.name == category)
             .map(|c| c.save_path.clone())
             .filter(|path| !path.is_empty());
+        let offered = match &self.stage {
+            Stage::Ready(preview) => preview.save_path.clone(),
+            _ => settings.download_dir.clone(),
+        };
         let hint = match (category.is_empty(), custom) {
-            (true, _) => settings.download_dir,
+            (true, _) => offered,
             (false, Some(path)) => path,
             (false, None) => Path::new(&settings.download_dir)
                 .join(&category)
@@ -237,14 +241,18 @@ impl AddView {
         let text = |input: &Entity<InputState>| {
             Some(input.read(cx).value().trim().to_string()).filter(|value| !value.is_empty())
         };
+        let category = text(&self.category);
+        let save_path =
+            text(&self.save_path).or_else(|| category.is_none().then(|| preview.save_path.clone()));
         let request = AddRequest {
             source: Source::Resolved(preview.id.clone()),
-            save_path: text(&self.save_path),
-            category: text(&self.category),
+            save_path,
+            category,
             tags,
             paused: Some(!self.start),
             files: (files.len() < self.files.len()).then_some(files),
             skip_check: self.skip_check,
+            remember_path: true,
         };
         self.busy = true;
         self.error = None;

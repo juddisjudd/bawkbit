@@ -246,19 +246,8 @@ impl TorrentList {
                 act(&self.engine, action, window, cx);
             }
             "delete" | "backspace" if !ids.is_empty() => {
-                if keystroke.modifiers.shift {
-                    confirm_delete(self.engine.clone(), ids, window, cx);
-                } else {
-                    act(
-                        &self.engine,
-                        Action::Remove {
-                            ids,
-                            delete_files: false,
-                        },
-                        window,
-                        cx,
-                    );
-                }
+                let delete_files = keystroke.modifiers.shift;
+                prompts::remove_torrents(self.engine.clone(), ids, delete_files, window, cx);
             }
             "up" | "down" => {
                 let rows = self.refresh(cx);
@@ -772,69 +761,17 @@ fn row_menu(
         },
     );
 
-    let delete_ids = ids.clone();
-    let delete_engine = engine.clone();
-    menu.separator()
-        .item(item(
-            "remove",
-            IconName::X,
-            Action::Remove {
-                ids,
-                delete_files: false,
-            },
-        ))
-        .item(
-            PopupMenuItem::new("remove and delete files")
-                .icon(Icon::new(IconName::Trash))
-                .on_click(move |_, window, cx| {
-                    confirm_delete(delete_engine.clone(), delete_ids.clone(), window, cx)
-                }),
-        )
-}
-
-fn confirm_delete(engine: Entity<Engine>, ids: Vec<Id>, window: &mut Window, cx: &mut App) {
-    let names: Vec<String> = engine
-        .read(cx)
-        .snapshot
-        .torrents
-        .iter()
-        .filter(|t| ids.contains(&t.id))
-        .map(|t| t.name.clone())
-        .collect();
-    let title: SharedString = match names.as_slice() {
-        [one] => format!("delete {one} and its files?").into(),
-        many => format!("delete {} torrents and their files?", many.len()).into(),
-    };
-    window.open_dialog(cx, move |dialog, _, cx| {
+    let remove = |label: &'static str, icon: IconName, delete_files: bool| {
         let (engine, ids) = (engine.clone(), ids.clone());
-        dialog
-            .title(title.clone())
-            .child("the downloaded files go too. this cannot be undone.")
-            .footer(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        kit::button("cancel-delete", cx)
-                            .label("cancel")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    )
-                    .child(
-                        Button::new("confirm-delete")
-                            .danger()
-                            .label("delete")
-                            .on_click(move |_, window, cx| {
-                                let action = Action::Remove {
-                                    ids: ids.clone(),
-                                    delete_files: true,
-                                };
-                                run_action(&engine, action, window, cx);
-                                window.close_dialog(cx);
-                            }),
-                    ),
-            )
-    });
+        PopupMenuItem::new(label)
+            .icon(Icon::new(icon))
+            .on_click(move |_, window, cx| {
+                prompts::remove_torrents(engine.clone(), ids.clone(), delete_files, window, cx)
+            })
+    };
+    menu.separator()
+        .item(remove("remove", IconName::X, false))
+        .item(remove("remove and delete files", IconName::Trash, true))
 }
 
 /// A one-line prompt, such as for a new category name.

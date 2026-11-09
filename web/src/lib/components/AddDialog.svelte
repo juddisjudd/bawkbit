@@ -126,7 +126,8 @@
         tags: tags.split(',').map((t) => t.trim()).filter(Boolean),
         paused: !start,
         files: chosen.size === preview.files.length ? null : [...chosen].sort((a, b) => a - b),
-        skip_check: skipCheck
+        skip_check: skipCheck,
+        remember_path: true
       })
       app.click(id, { ctrlKey: false, metaKey: false, shiftKey: false })
       close()

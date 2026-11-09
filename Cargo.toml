@@ -73,6 +73,7 @@ ring = { opt-level = 3 }
 
 [patch.crates-io]
 librqbit = { path = "vendor/librqbit" }
+librqbit-tracker-comms = { path = "vendor/librqbit-tracker-comms" }
 
 [profile.release]
 lto = "thin"

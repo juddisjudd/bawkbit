@@ -17,6 +17,8 @@ pub struct Store {
     pub tags: BTreeSet<String>,
     /// Magnet links still fetching their file list, which the engine itself does not keep across a restart.
     pub waiting: BTreeMap<Id, Waiting>,
+    /// The folder last picked in an add dialog, offered first in the next one.
+    pub last_save_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

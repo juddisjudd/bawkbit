@@ -1,0 +1,295 @@
+diff -ru a/src/tracker_comms.rs b/src/tracker_comms.rs
+--- a/src/tracker_comms.rs	2026-11-08 21:40:11.732690100 -0800
++++ b/src/tracker_comms.rs	2026-11-08 21:40:11.762705600 -0800
+@@ -1,9 +1,11 @@
++use std::collections::HashMap;
+ use std::collections::HashSet;
+ use std::net::SocketAddr;
+ use std::net::SocketAddrV4;
+ use std::net::SocketAddrV6;
+ use std::sync::Arc;
+ use std::time::Duration;
++use std::time::SystemTime;
+ 
+ use anyhow::Context;
+ use anyhow::bail;
+@@ -36,6 +38,41 @@
+     announce_port: u16,
+     reqwest_client: reqwest::Client,
+     key: u32,
++    status: TrackerStatuses,
++}
++
++/// A tracker that takes longer than this to answer counts as failed, so the next try comes.
++const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum TrackerState {
++    #[default]
++    NotContacted,
++    Working,
++    Failing,
++}
++
++/// What one tracker said the last time this torrent announced to it.
++#[derive(Clone, Debug, Default)]
++pub struct TrackerStatus {
++    pub state: TrackerState,
++    pub message: Option<String>,
++    pub peers: usize,
++    pub seeders: Option<u32>,
++    pub leechers: Option<u32>,
++    pub last_announce: Option<SystemTime>,
++    pub last_success: Option<SystemTime>,
++    pub failing_since: Option<SystemTime>,
++    pub failures: u32,
++}
++
++pub type TrackerStatuses = Arc<parking_lot::RwLock<HashMap<Url, TrackerStatus>>>;
++
++struct Announced {
++    interval: Duration,
++    peers: usize,
++    seeders: u32,
++    leechers: u32,
+ }
+ 
+ #[derive(Default)]
+@@ -149,7 +186,15 @@
+         announce_port: u16,
+         reqwest_client: reqwest::Client,
+         udp_client: UdpTrackerClient,
++        status: TrackerStatuses,
+     ) -> Option<BoxStream<'static, SocketAddr>> {
++        {
++            let mut status = status.write();
++            status.retain(|url, _| trackers.contains(url));
++            for url in &trackers {
++                status.entry(url.clone()).or_default();
++            }
++        }
+         let trackers = trackers
+             .into_iter()
+             .filter_map(|t| match t.scheme() {
+@@ -181,6 +226,7 @@
+                 announce_port,
+                 reqwest_client,
+                 key: rand::random(),
++                status,
+             });
+             let mut futures = FuturesUnordered::new();
+             for tracker in trackers {
+@@ -240,18 +286,33 @@
+         let mut event = Some(tracker_comms_http::TrackerRequestEvent::Started);
+ 
+         loop {
+-            let interval = (|| self.tracker_one_request_http(&tracker_url, event))
+-                .retry(
+-                    ExponentialBuilder::new()
+-                        .without_max_times()
+-                        .with_jitter()
+-                        .with_factor(2.)
+-                        .with_min_delay(Duration::from_secs(10))
+-                        .with_max_delay(Duration::from_secs(600)),
++            let interval = (|| async {
++                let result = match tokio::time::timeout(
++                    HTTP_TIMEOUT,
++                    self.tracker_one_request_http(&tracker_url, event),
+                 )
+-                .notify(|err, retry_in| debug!(?retry_in, "error calling tracker: {err:#}"))
+                 .await
+-                .context("this shouldn't fail")?;
++                {
++                    Ok(result) => result,
++                    Err(_) => Err(anyhow::anyhow!(
++                        "no answer in {} seconds",
++                        HTTP_TIMEOUT.as_secs()
++                    )),
++                };
++                self.note(&tracker_url, &result);
++                result.map(|announced| announced.interval)
++            })
++            .retry(
++                ExponentialBuilder::new()
++                    .without_max_times()
++                    .with_jitter()
++                    .with_factor(2.)
++                    .with_min_delay(Duration::from_secs(10))
++                    .with_max_delay(Duration::from_secs(600)),
++            )
++            .notify(|err, retry_in| debug!(?retry_in, "error calling tracker: {err:#}"))
++            .await
++            .context("this shouldn't fail")?;
+ 
+             event = None;
+             let interval = self.force_tracker_interval.unwrap_or(interval);
+@@ -264,7 +325,7 @@
+         &self,
+         tracker_url: &Url,
+         event: Option<tracker_comms_http::TrackerRequestEvent>,
+-    ) -> anyhow::Result<Duration> {
++    ) -> anyhow::Result<Announced> {
+         let stats = self.stats.get();
+         let request = tracker_comms_http::TrackerRequest {
+             info_hash: &self.info_hash,
+@@ -290,11 +351,19 @@
+         }
+         url.set_query(Some(&queries));
+ 
+-        let response: reqwest::Response = self.reqwest_client.get(url).send().await?;
++        let response: reqwest::Response = self
++            .reqwest_client
++            .get(url)
++            .send()
++            .await
++            .map_err(reqwest::Error::without_url)?;
+         if !response.status().is_success() {
+             anyhow::bail!("tracker responded with {:?}", response.status());
+         }
+-        let bytes = response.bytes().await?;
++        let bytes = response
++            .bytes()
++            .await
++            .map_err(reqwest::Error::without_url)?;
+         if let Ok((error, _)) =
+             bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(&bytes)
+         {
+@@ -310,12 +379,47 @@
+             })?
+             .0;
+ 
++        let mut peers = 0;
+         for peer in response.iter_peers() {
+             self.tx.send(peer).await?;
++            peers += 1;
+         }
+-        Ok(Duration::from_secs(
+-            response.min_interval.unwrap_or(response.interval),
+-        ))
++        Ok(Announced {
++            interval: Duration::from_secs(response.min_interval.unwrap_or(response.interval)),
++            peers,
++            seeders: response.complete.min(u32::MAX as u64) as u32,
++            leechers: response.incomplete.min(u32::MAX as u64) as u32,
++        })
++    }
++
++    fn note(&self, url: &Url, result: &anyhow::Result<Announced>) {
++        let announced = match result {
++            Ok(announced) => announced,
++            Err(err) => return self.note_failure(url, err),
++        };
++        let now = SystemTime::now();
++        let mut statuses = self.status.write();
++        let status = statuses.entry(url.clone()).or_default();
++        status.state = TrackerState::Working;
++        status.message = None;
++        status.peers = announced.peers;
++        status.seeders = Some(announced.seeders);
++        status.leechers = Some(announced.leechers);
++        status.last_announce = Some(now);
++        status.last_success = Some(now);
++        status.failing_since = None;
++        status.failures = 0;
++    }
++
++    fn note_failure(&self, url: &Url, err: &anyhow::Error) {
++        let now = SystemTime::now();
++        let mut statuses = self.status.write();
++        let status = statuses.entry(url.clone()).or_default();
++        status.state = TrackerState::Failing;
++        status.message = Some(format!("{err:#}"));
++        status.last_announce = Some(now);
++        status.failing_since.get_or_insert(now);
++        status.failures += 1;
+     }
+ 
+     async fn task_single_tracker_monitor_udp(
+@@ -352,24 +456,20 @@
+                     .with_max_delay(Duration::from_secs(60))
+                     .with_jitter(),
+             )
+-            .notify(|err, retry| debug!(retry_in=?retry, "error resolving tracker: {err:#}"))
++            .notify(|err, retry| {
++                debug!(retry_in=?retry, "error resolving tracker: {err:#}");
++                self.note_failure(&url, err);
++            })
+             .await
+             .context("this shouldn't happen: failed resolving tracker addrs")?;
+ 
+             prev_addrs = Some(addrs);
+ 
+-            match addrs {
++            let result = match addrs {
+                 UdpTrackerResolveResult::One(addr) => {
+-                    match self
+-                        .tracker_one_request_udp(addr, &client)
++                    self.tracker_one_request_udp(addr, &client)
+                         .instrument(trace_span!("udp request", ?addr))
+                         .await
+-                    {
+-                        Ok(sleep) => sleep_interval = Some(sleep),
+-                        Err(_) => {
+-                            sleep_interval = Some(sleep_interval.unwrap_or(Duration::from_secs(60)))
+-                        }
+-                    }
+                 }
+                 UdpTrackerResolveResult::Two(v4, v6) => {
+                     let (r4, r6) = tokio::join!(
+@@ -378,14 +478,20 @@
+                         self.tracker_one_request_udp(v6.into(), &client)
+                             .instrument(trace_span!("udp request", addr=?v6))
+                     );
+-                    sleep_interval = Some(
+-                        r4.or(r6)
+-                            .ok()
+-                            .or(sleep_interval)
+-                            .unwrap_or(Duration::from_secs(60)),
+-                    )
++                    match (r4, r6) {
++                        (Ok(announced), _) | (_, Ok(announced)) => Ok(announced),
++                        (Err(err), _) => Err(err),
++                    }
+                 }
+-            }
++            };
++            self.note(&url, &result);
++            sleep_interval = Some(
++                result
++                    .map(|announced| announced.interval)
++                    .ok()
++                    .or(sleep_interval)
++                    .unwrap_or(Duration::from_secs(60)),
++            );
+         }
+     }
+ 
+@@ -393,7 +499,7 @@
+         &self,
+         addr: SocketAddr,
+         client: &UdpTrackerClient,
+-    ) -> anyhow::Result<Duration> {
++    ) -> anyhow::Result<Announced> {
+         use tracker_comms_udp::*;
+ 
+         let stats = self.stats.get();
+@@ -422,12 +528,18 @@
+         match client.announce(addr, request).await {
+             Ok(response) => {
+                 trace!(len = response.addrs.len(), "received announce response");
++                let peers = response.addrs.len();
+                 for addr in response.addrs {
+                     self.tx.send(addr).await.context("rx closed")?;
+                 }
+                 let sleep = response.interval.max(5);
+                 let sleep = Duration::from_secs(sleep as u64);
+-                Ok(sleep)
++                Ok(Announced {
++                    interval: sleep,
++                    peers,
++                    seeders: response.seeders,
++                    leechers: response.leechers,
++                })
+             }
+             Err(e) => {
+                 debug!(?addr, "error reading announce response: {e:#}");

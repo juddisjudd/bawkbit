@@ -8,7 +8,7 @@ export type SortKey = 'name' | 'size' | 'progress' | 'down' | 'up' | 'eta' | 'ra
 export type ThemeChoice = 'system' | 'dark' | 'light'
 export type DetailsTab = 'overview' | 'files' | 'peers' | 'trackers'
 export type View = 'list' | 'search' | 'rss' | 'settings'
-export type SettingsTab = 'downloads' | 'connection' | 'speed' | 'queue' | 'search' | 'rss' | 'web' | 'backup' | 'appearance'
+export type SettingsTab = 'downloads' | 'connection' | 'trackers' | 'speed' | 'queue' | 'search' | 'rss' | 'web' | 'backup' | 'appearance'
 export type RssTab = 'feeds' | 'rules'
 
 export interface MenuItem {

@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use bawkbit_core::{Feed, FeedItem, Rss, RssAction, Rule, RuleMatch};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -243,18 +245,33 @@ impl RssView {
     }
 
     fn remove_rule(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.editor.take() else {
+        let Some(editor) = self.editor.as_ref() else {
             return;
         };
-        if !editor.id.is_empty() {
-            self.run(
-                RssAction::RemoveRule { id: editor.id },
-                |_, _, _| {},
-                window,
-                cx,
-            );
+        if editor.id.is_empty() {
+            self.editor = None;
+            cx.notify();
+            return;
         }
-        cx.notify();
+        let id = editor.id.clone();
+        let name = editor.name.read(cx).value().trim().to_string();
+        let title = if name.is_empty() {
+            "remove this rule?".to_string()
+        } else {
+            format!("remove the rule {name}?")
+        };
+        let view = cx.entity().downgrade();
+        let remove = prompts::Choice::new("remove", move |window, cx| {
+            let id = id.clone();
+            let _ = view.update(cx, |this, cx| {
+                this.editor = None;
+                this.run(RssAction::RemoveRule { id }, |_, _, _| {}, window, cx);
+                cx.notify();
+            });
+        })
+        .danger();
+        let body = "what it already added stays in the list.";
+        prompts::confirm(title, body, remove, None, window, cx);
     }
 
     fn render_tabs(&self, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -854,9 +871,21 @@ fn feed_menu(
         .item(
             PopupMenuItem::new("remove feed")
                 .icon(Icon::new(IconName::Trash))
-                .on_click(action(RssAction::RemoveFeed {
-                    id: feed.id.clone(),
-                })),
+                .on_click({
+                    let remove = Rc::new(action(RssAction::RemoveFeed {
+                        id: feed.id.clone(),
+                    }));
+                    let title = format!("remove {}?", feed.label());
+                    move |event, window, cx| {
+                        let (remove, event) = (remove.clone(), event.clone());
+                        let choice = prompts::Choice::new("remove", move |window, cx| {
+                            remove(&event, window, cx)
+                        })
+                        .danger();
+                        let body = "rules that watch only this feed are turned off.";
+                        prompts::confirm(title.clone(), body, choice, None, window, cx);
+                    }
+                }),
         )
 }
 

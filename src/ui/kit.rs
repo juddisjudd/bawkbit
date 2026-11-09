@@ -26,6 +26,20 @@ pub fn button(id: impl Into<ElementId>, cx: &App) -> Button {
         .border_color(p.border_weak)
 }
 
+/// The plain button in red, for a second choice that destroys something.
+pub fn danger_button(id: impl Into<ElementId>, cx: &App) -> Button {
+    let p = palette(cx);
+    Button::new(id)
+        .custom(
+            ButtonCustomVariant::new(cx)
+                .foreground(p.danger)
+                .hover(p.bg_hover)
+                .active(p.border_weak),
+        )
+        .border_1()
+        .border_color(p.border_weak)
+}
+
 pub fn icon_button(id: impl Into<ElementId>, icon: IconName, tooltip: &'static str) -> Button {
     Button::new(id)
         .ghost()

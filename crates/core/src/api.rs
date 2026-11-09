@@ -129,6 +129,35 @@ pub struct Peer {
     pub up: u64,
     pub downloaded: u64,
     pub uploaded: u64,
+    /// Two capital letters, such as DE, while peer countries are on and known.
+    #[serde(default)]
+    pub country: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackerStatus {
+    /// Not asked yet, such as while the torrent is paused.
+    #[default]
+    Waiting,
+    Working,
+    Failing,
+}
+
+/// What one tracker said the last time this torrent announced to it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrackerReport {
+    pub url: String,
+    pub status: TrackerStatus,
+    /// Why it failed.
+    pub message: Option<String>,
+    /// Peers its last answer gave.
+    pub peers: u32,
+    pub seeds: Option<u32>,
+    pub leechers: Option<u32>,
+    /// Unix seconds of the last answer or failure.
+    pub updated: Option<i64>,
 }
 
 /// One torrent in full, fetched while its details are open.
@@ -146,6 +175,22 @@ pub struct Details {
     pub files: Vec<File>,
     pub peers: Vec<Peer>,
     pub trackers: Vec<String>,
+    /// One for each of `trackers`, in the same order.
+    #[serde(default)]
+    pub tracker_reports: Vec<TrackerReport>,
+    /// Private torrents use only their own tracker, so public lists never go on them.
+    #[serde(default)]
+    pub private: bool,
+}
+
+/// The public tracker lists under settings, as last read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackerLists {
+    /// Trackers they give, without repeats.
+    pub trackers: usize,
+    /// Unix seconds of the last time they were read.
+    pub fetched: Option<i64>,
+    pub errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -193,6 +238,9 @@ pub struct AddRequest {
     /// Trusts that the files are complete, so only a spot check runs instead of a full one.
     #[serde(default)]
     pub skip_check: bool,
+    /// A person picked `save_path` in an add dialog, so the next dialog offers it first.
+    #[serde(default)]
+    pub remember_path: bool,
 }
 
 impl AddRequest {
@@ -205,6 +253,7 @@ impl AddRequest {
             paused: None,
             files: None,
             skip_check: false,
+            remember_path: false,
         }
     }
 }
@@ -282,6 +331,10 @@ pub enum Action {
     SetTrackers {
         id: Id,
         trackers: Vec<String>,
+    },
+    /// Adds the trackers from the public lists under settings; private torrents are skipped.
+    AddListTrackers {
+        ids: Vec<Id>,
     },
     SetNoUpload {
         ids: Vec<Id>,

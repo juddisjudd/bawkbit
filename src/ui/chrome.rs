@@ -299,10 +299,16 @@ impl Workspace {
                         PopupMenuItem::new("remove category")
                             .icon(Icon::new(IconName::Trash))
                             .on_click(move |_, window, cx| {
-                                let action = Action::RemoveCategory {
-                                    name: remove_name.clone(),
+                                let name = remove_name.clone();
+                                let title = format!("remove the category {name}?");
+                                let body = match count {
+                                    0 => "no torrent is in it.".to_string(),
+                                    1 => "its torrent stays, with no category.".to_string(),
+                                    n => format!("its {n} torrents stay, with no category."),
                                 };
-                                run_action(&remove_engine, action, window, cx);
+                                let action = Action::RemoveCategory { name };
+                                let engine = remove_engine.clone();
+                                prompts::confirm_action(engine, title, body, action, window, cx);
                             }),
                     )
                 })
@@ -353,9 +359,18 @@ impl Workspace {
                         PopupMenuItem::new("remove tag")
                             .icon(Icon::new(IconName::Trash))
                             .on_click(move |_, window, cx| {
-                                run_action(
-                                    &engine,
-                                    Action::RemoveTag { tag: tag.clone() },
+                                let title = format!("remove the tag {tag}?");
+                                let body = match count {
+                                    0 => "no torrent has it.".to_string(),
+                                    1 => "one torrent loses it.".to_string(),
+                                    n => format!("{n} torrents lose it."),
+                                };
+                                let action = Action::RemoveTag { tag: tag.clone() };
+                                prompts::confirm_action(
+                                    engine.clone(),
+                                    title,
+                                    body,
+                                    action,
                                     window,
                                     cx,
                                 );

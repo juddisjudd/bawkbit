@@ -36,9 +36,36 @@ pub struct Settings {
     pub on_finish: String,
     /// Minutes between checks of each RSS feed.
     pub rss_minutes: u32,
+    /// Shows each peer's country, from a free database bawkbit downloads once a month.
+    pub peer_countries: bool,
+    pub trackers: Trackers,
     pub web: Web,
     /// Prowlarr and Jackett servers that search answers come from.
     pub indexers: Vec<Indexer>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Trackers {
+    /// Adds the trackers from `lists` to every new torrent that is not private.
+    pub add_from_lists: bool,
+    /// Addresses of text files with one tracker on each line.
+    pub lists: Vec<String>,
+    /// Takes a tracker off a torrent that is not private once it has failed for an hour without one answer.
+    pub remove_dead: bool,
+}
+
+impl Default for Trackers {
+    fn default() -> Self {
+        Self {
+            add_from_lists: false,
+            lists: vec![
+                crate::trackers::NGOSANG_BEST.into(),
+                crate::trackers::XIU2_BEST.into(),
+            ],
+            remove_dead: false,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -63,6 +90,8 @@ impl Default for Settings {
             utp: false,
             on_finish: String::new(),
             rss_minutes: 30,
+            peer_countries: true,
+            trackers: Trackers::default(),
             web: Web::default(),
             indexers: Vec::new(),
         }
