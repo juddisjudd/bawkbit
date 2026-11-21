@@ -132,6 +132,9 @@ pub struct Peer {
     /// Two capital letters, such as DE, while peer countries are on and known.
     #[serde(default)]
     pub country: Option<String>,
+    /// How much of the torrent the peer has, 0 to 1.
+    #[serde(default)]
+    pub progress: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +161,18 @@ pub struct TrackerReport {
     pub leechers: Option<u32>,
     /// Unix seconds of the last answer or failure.
     pub updated: Option<i64>,
+}
+
+/// One tab of a torrent's details, for fetching only what that tab shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailsPart {
+    /// The piece map.
+    Overview,
+    Files,
+    Peers,
+    /// What each tracker last said.
+    Trackers,
 }
 
 /// One torrent in full, fetched while its details are open.

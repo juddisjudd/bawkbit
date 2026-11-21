@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{ErrorKind, Write as _};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{AddRequest, Id};
@@ -53,10 +56,7 @@ pub struct Entry {
 
 impl Store {
     pub fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        read_json(path).unwrap_or_default()
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
@@ -82,13 +82,38 @@ impl Store {
     }
 }
 
-/// Writes next to the target and renames, so a crash never leaves half a file.
+/// Reads a JSON file; one that exists but cannot be read is moved aside, so the next save cannot wipe it.
+pub fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let problem = match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(value) => return Some(value),
+            Err(err) => err.to_string(),
+        },
+        Err(err) if err.kind() == ErrorKind::NotFound => return None,
+        Err(err) => err.to_string(),
+    };
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".bad-{}", crate::now()));
+    match std::fs::rename(path, &aside) {
+        Ok(()) => tracing::warn!("{path:?} is damaged ({problem}); kept it as {aside:?}"),
+        Err(err) => tracing::warn!("{path:?} is damaged ({problem}) and cannot be kept: {err}"),
+    }
+    None
+}
+
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+/// Writes next to the target, flushes and renames, so a crash or power cut never leaves half a file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes)?;
+    // Two saves of one file at once must not share a temporary file.
+    let tmp = path.with_extension(format!("tmp{}", NEXT_TMP.fetch_add(1, Ordering::Relaxed)));
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(tmp, path)
 }
 
@@ -104,9 +129,30 @@ mod tests {
         store.entry("abc").tags.push("linux".into());
         store.categories.insert("iso".into(), String::new());
         store.save(&path).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         let loaded = Store::load(&path);
         assert_eq!(loaded.torrents["abc"].tags, vec!["linux".to_string()]);
         assert_eq!(loaded.all_tags(), vec!["linux".to_string()]);
         assert!(loaded.categories.contains_key("iso"));
+    }
+
+    #[test]
+    fn a_damaged_file_is_kept_aside_instead_of_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torrents.json");
+        assert!(Store::load(&path).torrents.is_empty());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let damaged = b"{\"torrents\": {\"abc\": ";
+        std::fs::write(&path, damaged).unwrap();
+        assert!(Store::load(&path).torrents.is_empty());
+        assert!(!path.exists());
+        let kept: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].starts_with("torrents.json.bad-"), "{kept:?}");
+        assert_eq!(std::fs::read(dir.path().join(&kept[0])).unwrap(), damaged);
     }
 }

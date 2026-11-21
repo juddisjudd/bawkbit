@@ -1162,7 +1162,7 @@ impl SettingsView {
         panel()
             .child(field(
                 "downloads at once",
-                "the rest wait their turn",
+                "the rest wait their turn. one stuck for a minute lets the next start",
                 self.text(Field::MaxActive, p),
                 p,
             ))

@@ -1,6 +1,6 @@
 diff -ru a/src/lib.rs b/src/lib.rs
---- a/src/lib.rs	2026-11-08 21:40:11.174839100 -0800
-+++ b/src/lib.rs	2026-11-08 21:40:11.340903600 -0800
+--- a/src/lib.rs	2026-11-21 14:18:19.077145200 -0800
++++ b/src/lib.rs	2026-11-21 14:18:19.195800000 -0800
 @@ -100,6 +100,7 @@
      ManagedTorrent, ManagedTorrentShared, ManagedTorrentState, TorrentMetadata, TorrentStats,
      TorrentStatsState,
@@ -10,8 +10,8 @@ diff -ru a/src/lib.rs b/src/lib.rs
  
  pub use buffers::*;
 diff -ru a/src/limits.rs b/src/limits.rs
---- a/src/limits.rs	2026-11-08 21:40:10.943445800 -0800
-+++ b/src/limits.rs	2026-11-08 21:40:11.338905000 -0800
+--- a/src/limits.rs	2026-11-21 14:18:18.871996300 -0800
++++ b/src/limits.rs	2026-11-21 14:18:19.194799200 -0800
 @@ -12,6 +12,9 @@
      pub download_bps: Option<NonZeroU32>,
  }
@@ -33,8 +33,8 @@ diff -ru a/src/limits.rs b/src/limits.rs
  
      fn new(bps: Option<NonZeroU32>) -> Self {
 diff -ru a/src/session.rs b/src/session.rs
---- a/src/session.rs	2026-11-08 21:40:10.780627700 -0800
-+++ b/src/session.rs	2026-11-08 21:40:11.339904300 -0800
+--- a/src/session.rs	2026-11-21 14:18:18.737337200 -0800
++++ b/src/session.rs	2026-11-21 14:18:19.194799200 -0800
 @@ -6,7 +6,7 @@
      path::{Component, Path, PathBuf},
      sync::{
@@ -125,8 +125,17 @@ diff -ru a/src/session.rs b/src/session.rs
  
          let initial_peers_rx = if initial_peers.is_empty() {
 diff -ru a/src/torrent_state/live/mod.rs b/src/torrent_state/live/mod.rs
---- a/src/torrent_state/live/mod.rs	2026-11-08 21:40:11.029199300 -0800
-+++ b/src/torrent_state/live/mod.rs	2026-11-08 21:40:11.311823700 -0800
+--- a/src/torrent_state/live/mod.rs	2026-11-21 14:18:18.944523000 -0800
++++ b/src/torrent_state/live/mod.rs	2026-11-21 14:18:19.179791800 -0800
+@@ -104,7 +104,7 @@
+         PeerRx, PeerState, PeerTx, RemoveInflightRequestResult,
+         stats::{
+             atomic::PeerCountersAtomic as AtomicPeerCounters,
+-            snapshot::{PeerStatsFilter, PeerStatsSnapshot},
++            snapshot::{PeerStats, PeerStatsFilter, PeerStatsSnapshot},
+         },
+     },
+     peers::PeerStates,
 @@ -213,7 +213,7 @@
          tokio::sync::mpsc::UnboundedSender<WriterRequest>,
          ChunkInfo,
@@ -162,7 +171,26 @@ diff -ru a/src/torrent_state/live/mod.rs b/src/torrent_state/live/mod.rs
              if let Some(session) = self.shared.session.upgrade() {
                  tokio::select! {
                      _ = tx.closed() => {
-@@ -1711,6 +1721,12 @@
+@@ -754,13 +764,17 @@
+     }
+ 
+     pub fn per_peer_stats_snapshot(&self, filter: PeerStatsFilter) -> PeerStatsSnapshot {
++        let total_pieces = self.lengths.total_pieces() as usize;
+         PeerStatsSnapshot {
+             peers: self
+                 .peers
+                 .states
+                 .iter()
+                 .filter(|e| filter.state.matches(e.value().get_state()))
+-                .map(|e| (e.key().to_string(), e.value().into()))
++                .map(|e| {
++                    let stats = PeerStats::new(e.value(), total_pieces);
++                    (e.key().to_string(), stats)
++                })
+                 .collect(),
+         }
+     }
+@@ -1711,6 +1725,12 @@
                      .prepare_for_download(NonZeroU32::new(request.length).unwrap())
                      .await?;
  
@@ -175,9 +203,41 @@ diff -ru a/src/torrent_state/live/mod.rs b/src/torrent_state/live/mod.rs
                  if let Some(session) = self.state.torrent().session.upgrade() {
                      session
                          .ratelimits
+diff -ru a/src/torrent_state/live/peer/stats/snapshot.rs b/src/torrent_state/live/peer/stats/snapshot.rs
+--- a/src/torrent_state/live/peer/stats/snapshot.rs	2026-11-21 14:18:18.927990800 -0800
++++ b/src/torrent_state/live/peer/stats/snapshot.rs	2026-11-21 14:18:19.178786300 -0800
+@@ -29,6 +29,8 @@
+     pub state: &'static str,
+     pub conn_kind: Option<ConnectionKind>,
+     pub client_name: Option<String>,
++    /// Pieces of the torrent the peer says it has.
++    pub have_pieces: u32,
+ }
+ 
+ impl From<&super::atomic::PeerCountersAtomic> for PeerCounters {
+@@ -54,10 +56,17 @@
+     }
+ }
+ 
+-impl From<&Peer> for PeerStats {
+-    fn from(peer: &Peer) -> Self {
++impl PeerStats {
++    pub(crate) fn new(peer: &Peer, total_pieces: usize) -> Self {
+         let state = peer.get_state();
+         Self {
++            have_pieces: match state {
++                PeerState::Live(l) => l
++                    .bitfield
++                    .get(..total_pieces)
++                    .map_or(0, |bits| bits.count_ones() as u32),
++                _ => 0,
++            },
+             counters: peer.stats.counters.as_ref().into(),
+             state: state.name(),
+             conn_kind: match state {
 diff -ru a/src/torrent_state/mod.rs b/src/torrent_state/mod.rs
---- a/src/torrent_state/mod.rs	2026-11-08 21:40:11.038721300 -0800
-+++ b/src/torrent_state/mod.rs	2026-11-08 21:40:11.318187800 -0800
+--- a/src/torrent_state/mod.rs	2026-11-21 14:18:18.952031800 -0800
++++ b/src/torrent_state/mod.rs	2026-11-21 14:18:19.182792900 -0800
 @@ -10,7 +10,7 @@
  use std::path::{Path, PathBuf};
  use std::sync::Arc;

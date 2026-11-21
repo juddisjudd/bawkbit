@@ -741,8 +741,7 @@ fn row_menu(
                 picked.iter().map(text).collect::<Vec<_>>().join("\n")
             };
             let magnets = joined(&|t| {
-                core.details(&t.id)
-                    .map(|details| details.magnet)
+                core.magnet(&t.id)
                     .unwrap_or_else(|_| format!("magnet:?xt=urn:btih:{}", t.id))
             });
             let copy = |label: &'static str, text: String, note: &'static str| {

@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use bawkbit_core::{Action, Feed, Id, RssAction};
+use bawkbit_core::{Action, DetailsPart, Feed, Id, RssAction};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
@@ -239,7 +239,7 @@ pub fn add_trackers(engine: Entity<Engine>, id: Id, window: &mut Window, cx: &mu
             let mut trackers = engine
                 .read(cx)
                 .core()
-                .details(&id)
+                .details_part(&id, DetailsPart::Trackers)
                 .map(|details| details.trackers)
                 .unwrap_or_default();
             trackers.extend(typed);

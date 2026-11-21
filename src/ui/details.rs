@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use bawkbit_core::{Action, Details, Id, Torrent, TrackerReport, TrackerStatus};
+use bawkbit_core::{Action, Details, DetailsPart, Id, Torrent, TrackerReport, TrackerStatus};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::notification::Notification;
@@ -50,6 +50,46 @@ impl Tab {
             Tab::Trackers => IconName::Server,
         }
     }
+
+    fn part(self) -> DetailsPart {
+        match self {
+            Tab::Overview => DetailsPart::Overview,
+            Tab::Files => DetailsPart::Files,
+            Tab::Peers => DetailsPart::Peers,
+            Tab::Trackers => DetailsPart::Trackers,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackerSort {
+    Address,
+    WorkingFirst,
+    FailingFirst,
+}
+
+impl TrackerSort {
+    const ALL: [TrackerSort; 3] = [
+        TrackerSort::Address,
+        TrackerSort::WorkingFirst,
+        TrackerSort::FailingFirst,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            TrackerSort::Address => "a–z",
+            TrackerSort::WorkingFirst => "working first",
+            TrackerSort::FailingFirst => "failing first",
+        }
+    }
+}
+
+fn status_rank(status: TrackerStatus) -> u8 {
+    match status {
+        TrackerStatus::Working => 0,
+        TrackerStatus::Waiting => 1,
+        TrackerStatus::Failing => 2,
+    }
 }
 
 pub enum DetailsEvent {
@@ -60,9 +100,14 @@ pub struct DetailsView {
     engine: Entity<Engine>,
     id: Option<Id>,
     details: Option<Details>,
+    /// The tab `details` was fetched for; it holds only that tab's lists.
+    part: Option<DetailsPart>,
     tab: Tab,
+    tracker_sort: TrackerSort,
     files_scroll: VirtualListScrollHandle,
     file_sizes: Rc<Vec<Size<Pixels>>>,
+    fetching: bool,
+    _fetch: Task<()>,
     _poll: Task<()>,
 }
 
@@ -73,7 +118,12 @@ impl DetailsView {
         let poll = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                if this.update(cx, |this, cx| this.fetch(cx)).is_err() {
+                let polled = this.update(cx, |this, cx| {
+                    if !this.fetching {
+                        this.fetch(cx);
+                    }
+                });
+                if polled.is_err() {
                     break;
                 }
             }
@@ -82,9 +132,13 @@ impl DetailsView {
             engine,
             id: None,
             details: None,
+            part: None,
             tab: Tab::Overview,
+            tracker_sort: TrackerSort::Address,
             files_scroll: VirtualListScrollHandle::new(),
             file_sizes: Rc::default(),
+            fetching: false,
+            _fetch: Task::ready(()),
             _poll: poll,
         }
     }
@@ -99,18 +153,39 @@ impl DetailsView {
         }
         self.id = id;
         self.details = None;
+        self.part = None;
         self.fetch(cx);
     }
 
+    /// Asks the engine, on its own runtime, for what the open tab shows; a newer fetch replaces one still running.
     fn fetch(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.id.clone() else {
             return;
         };
-        self.details = self.engine.read(cx).core().details(&id).ok();
-        let files = self.details.as_ref().map_or(0, |d| d.files.len());
-        if self.file_sizes.len() != files {
-            self.file_sizes = Rc::new(vec![size(px(1.), px(FILE_ROW)); files]);
-        }
+        let part = self.tab.part();
+        let job = {
+            let id = id.clone();
+            self.engine
+                .read(cx)
+                .run(move |core| async move { core.details_part(&id, part) })
+        };
+        self.fetching = true;
+        self._fetch = cx.spawn(async move |this, cx| {
+            let details = job.await.ok();
+            let _ = this.update(cx, |this, cx| {
+                this.fetching = false;
+                if this.id.as_ref() != Some(&id) || this.tab.part() != part {
+                    return;
+                }
+                let files = details.as_ref().map_or(0, |d| d.files.len());
+                if part == DetailsPart::Files && this.file_sizes.len() != files {
+                    this.file_sizes = Rc::new(vec![size(px(1.), px(FILE_ROW)); files]);
+                }
+                this.details = details;
+                this.part = Some(part);
+                cx.notify();
+            });
+        });
         cx.notify();
     }
 
@@ -180,8 +255,10 @@ impl DetailsView {
                     .child(Icon::new(tab.icon()).size(px(13.)))
                     .child(tab.label())
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.tab = tab;
-                        cx.notify();
+                        if this.tab != tab {
+                            this.tab = tab;
+                            this.fetch(cx);
+                        }
                     }))
             }))
             .child(div().flex_1())
@@ -462,7 +539,7 @@ impl DetailsView {
             .size_full()
             .overflow_y_scroll()
             .text_size(px(12.))
-            .children(peers.into_iter().map(|peer| {
+            .children(peers.into_iter().enumerate().map(|(ix, peer)| {
                 let country = peer.country.clone().unwrap_or_default();
                 let flag = crate::assets::flag(&country);
                 div()
@@ -504,6 +581,33 @@ impl DetailsView {
                         kit::truncate(peer.client.unwrap_or_default())
                             .flex_1()
                             .text_color(p.text),
+                    )
+                    .child(
+                        div()
+                            .id(("peer-has", ix))
+                            .w(px(96.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(kit::progress_bar(
+                                peer.progress,
+                                if peer.progress >= 1. { p.green } else { p.blue },
+                                p,
+                            ))
+                            .child(
+                                div()
+                                    .w(px(40.))
+                                    .flex_none()
+                                    .flex()
+                                    .justify_end()
+                                    .text_color(p.text_weak)
+                                    .child(format::percent(peer.progress)),
+                            )
+                            .tooltip(|window, cx| {
+                                Tooltip::new("how much of the torrent this peer has")
+                                    .build(window, cx)
+                            }),
                     )
                     .child(
                         div()
@@ -552,7 +656,32 @@ impl DetailsView {
             details.id.clone(),
             details.trackers.clone(),
         );
-        let reports = details.tracker_reports.clone();
+        let mut rows: Vec<(String, Option<TrackerReport>)> = trackers
+            .iter()
+            .map(|url| {
+                let report = details.tracker_reports.iter().find(|r| &r.url == url);
+                (url.clone(), report.cloned())
+            })
+            .collect();
+        let rank = |report: &Option<TrackerReport>| {
+            status_rank(report.as_ref().map_or(TrackerStatus::Waiting, |r| r.status))
+        };
+        match self.tracker_sort {
+            TrackerSort::Address => {}
+            TrackerSort::WorkingFirst => rows.sort_by_key(|(_, report)| rank(report)),
+            TrackerSort::FailingFirst => {
+                rows.sort_by_key(|(_, report)| std::cmp::Reverse(rank(report)))
+            }
+        }
+        let failing: Vec<String> = rows
+            .iter()
+            .filter(|(_, report)| {
+                report
+                    .as_ref()
+                    .is_some_and(|r| r.status == TrackerStatus::Failing)
+            })
+            .map(|(url, _)| url.clone())
+            .collect();
         let list: AnyElement = if trackers.is_empty() {
             placeholder("no trackers: peers come from DHT", p)
         } else {
@@ -562,11 +691,10 @@ impl DetailsView {
                 .overflow_y_scroll()
                 .py_2()
                 .text_size(px(12.))
-                .children(trackers.iter().enumerate().map(|(ix, url)| {
+                .children(rows.into_iter().enumerate().map(|(ix, (url, report))| {
                     let rest: Vec<String> =
-                        trackers.iter().filter(|t| *t != url).cloned().collect();
+                        trackers.iter().filter(|t| **t != url).cloned().collect();
                     let (engine, id) = (engine.clone(), id.clone());
-                    let report = reports.iter().find(|r| &r.url == url).cloned();
                     let (color, label, detail) = tracker_state(report.as_ref(), p);
                     div()
                         .h(px(28.))
@@ -612,6 +740,27 @@ impl DetailsView {
         };
         let private = details.private;
         let (list_engine, list_id) = (engine.clone(), id.clone());
+        let (failing_engine, failing_id) = (engine.clone(), id.clone());
+        let failing_count = failing.len();
+        let kept: Vec<String> = trackers
+            .iter()
+            .filter(|url| !failing.contains(url))
+            .cloned()
+            .collect();
+        let sort = kit::segmented(p)
+            .text_size(px(12.))
+            .children(TrackerSort::ALL.map(|sort| {
+                kit::segment(
+                    SharedString::from(format!("tracker-sort-{}", sort.label())),
+                    sort.label(),
+                    sort == self.tracker_sort,
+                    p,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tracker_sort = sort;
+                    cx.notify();
+                }))
+            }));
         div()
             .size_full()
             .flex()
@@ -622,6 +771,7 @@ impl DetailsView {
                     .px_4()
                     .py_2()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .child(
@@ -648,6 +798,37 @@ impl DetailsView {
                                 }),
                         )
                     })
+                    .when(failing_count > 0, |this| {
+                        this.child(
+                            kit::danger_button("remove-failing-trackers", cx)
+                                .small()
+                                .icon(Icon::new(IconName::Trash))
+                                .label(format!("remove failing ({failing_count})"))
+                                .on_click(move |_, window, cx| {
+                                    let body = if kept.is_empty() {
+                                        remove_all_failing_body(failing_count, private)
+                                    } else {
+                                        format!(
+                                            "take {} off this torrent? the other {} stay.",
+                                            trackers_word(failing_count),
+                                            kept.len()
+                                        )
+                                    };
+                                    let action = Action::SetTrackers {
+                                        id: failing_id.clone(),
+                                        trackers: kept.clone(),
+                                    };
+                                    prompts::confirm_action(
+                                        failing_engine.clone(),
+                                        "remove failing trackers",
+                                        body,
+                                        action,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                        )
+                    })
                     .when(private, |this| {
                         this.child(
                             div()
@@ -655,7 +836,9 @@ impl DetailsView {
                                 .text_color(p.text_weaker)
                                 .child("private torrent: public trackers stay off it."),
                         )
-                    }),
+                    })
+                    .child(div().flex_1())
+                    .when(trackers.len() > 1, |this| this.child(sort)),
             )
             .into_any_element()
     }
@@ -689,6 +872,23 @@ fn tracker_state(
     }
 }
 
+fn trackers_word(n: usize) -> String {
+    if n == 1 {
+        "1 failing tracker".into()
+    } else {
+        format!("{n} failing trackers")
+    }
+}
+
+fn remove_all_failing_body(n: usize, private: bool) -> String {
+    let after = if private {
+        "a private torrent finds peers only through its trackers, so it will find none."
+    } else {
+        "peers will come from DHT only."
+    };
+    format!("every tracker is failing. take all {n} off? {after}")
+}
+
 fn nonblank(text: String) -> String {
     if text.is_empty() { "–".into() } else { text }
 }
@@ -709,6 +909,7 @@ impl Render for DetailsView {
         let p = palette(cx);
         let torrent = self.torrent(cx);
         let body = match self.tab {
+            _ if self.part != Some(self.tab.part()) => div().into_any_element(),
             Tab::Overview => self.render_overview(torrent.as_ref(), &p, cx),
             Tab::Files => self.render_files(&p, cx),
             Tab::Peers => self.render_peers(&p),

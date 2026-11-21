@@ -43,10 +43,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Feeds {
     pub fn load(path: PathBuf) -> Self {
-        let state = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let state = crate::store::read_json(&path).unwrap_or_default();
         Self {
             path,
             http: client(),

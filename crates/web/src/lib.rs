@@ -1,12 +1,13 @@
 mod assets;
 mod auth;
+mod changes;
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -324,16 +325,25 @@ async fn snapshot(State(state): State<AppState>) -> Json<Arc<Snapshot>> {
     Json(state.core.snapshot())
 }
 
+#[derive(Deserialize)]
+struct EventsQuery {
+    /// After the first `snapshot`, send `changes` events with only what changed.
+    #[serde(default)]
+    changes: bool,
+}
+
 /// One `snapshot` event a second, and a `finished` event each time a torrent finishes, for as long as the page is open.
 async fn events(
     State(state): State<AppState>,
+    Query(query): Query<EventsQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let updates = state.core.subscribe();
     let finished = state.core.subscribe_finished();
     let stop = state.stop.clone();
+    let sent = query.changes.then(changes::Sent::default);
     let stream = futures_util::stream::unfold(
-        (updates, finished, stop, true),
-        |(mut updates, mut finished, mut stop, first)| async move {
+        (updates, finished, stop, sent, true),
+        |(mut updates, mut finished, mut stop, mut sent, first)| async move {
             let event = if first {
                 None
             } else {
@@ -356,13 +366,16 @@ async fn events(
                 Some(event) => event,
                 None => {
                     let snapshot = updates.borrow_and_update().clone();
-                    Event::default()
-                        .event("snapshot")
-                        .json_data(&*snapshot)
-                        .ok()?
+                    match sent.as_mut() {
+                        Some(sent) => sent.event(&snapshot)?,
+                        None => Event::default()
+                            .event("snapshot")
+                            .json_data(&*snapshot)
+                            .ok()?,
+                    }
                 }
             };
-            Some((Ok(event), (updates, finished, stop, false)))
+            Some((Ok(event), (updates, finished, stop, sent, false)))
         },
     );
     Sse::new(stream).keep_alive(KeepAlive::default())

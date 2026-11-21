@@ -91,7 +91,7 @@ To open magnet links and `.torrent` files from your browser in bawkbit on Window
 ### Control speed and sharing
 
 - **Speed limits**. The turtle in the title bar switches to slower alternative limits. A schedule can switch for you.
-- **A queue**: only a set number of downloads run at once. The rest wait their turn.
+- **A queue**: only a set number of downloads run at once. The rest wait their turn. A download stuck for a minute keeps going but lets the next one start.
 - **Seeding goals**: stop sharing at a ratio or after a set time.
 - **Per torrent**, from the right-click menu: force start past the queue, check again, no upload, its own speed limits, and more trackers. A torrent keeps what it has downloaded when you add trackers.
 - **More ways to connect**: DHT and peer exchange find peers without a tracker. UPnP opens the port on your router for you. uTP is off until you turn it on under **settings → connection**.
@@ -370,7 +370,7 @@ Read what is going on:
 | Request | Does |
 | --- | --- |
 | `GET /api/snapshot` | every torrent, the speeds, categories and tags |
-| `GET /api/events` | the same snapshot once a second, and a `finished` event for each finished download, as server-sent events |
+| `GET /api/events` | the same snapshot once a second, and a `finished` event for each finished download, as server-sent events. With `?changes=true`, only the first event is a full `snapshot`; each `changes` event after it has the rows that changed, the ids of rows that went away, the totals and the new speed samples |
 | `GET /api/torrents/{id}` | one torrent's files, peers with their country, trackers with what each last said, and piece map |
 
 Add and change torrents:

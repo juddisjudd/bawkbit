@@ -11,6 +11,7 @@ The changes:
 - Torrents can share a second set of limits, so a group of them stays under one speed together: `ManagedTorrent::set_group_ratelimits`. bawkbit uses it for category limits.
 - A rate limit always lets at least 128 KiB through at once. Before, a limit below one request (16 KiB/s) failed every request and dropped the peer.
 - The session keeps what each tracker of each torrent last said: `Session::tracker_status`. bawkbit shows it and uses it to find dead trackers.
+- Each peer's stats say how many of the torrent's pieces it has: `PeerStats::have_pieces`. bawkbit shows it as the peer's progress.
 
 ## librqbit-tracker-comms
 

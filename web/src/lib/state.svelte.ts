@@ -1,5 +1,6 @@
 import { SvelteSet } from 'svelte/reactivity'
-import { api, isLink, whenUnauthorized, type Action, type Finished, type Id, type Rss, type RssAction, type SearchCategory, type SearchReply, type SearchResult, type SessionInfo, type Settings, type Snapshot, type Torrent } from './api'
+import { api, isLink, whenUnauthorized, type Action, type Changes, type Finished, type Id, type Rss, type RssAction, type SearchCategory, type SearchReply, type SearchResult, type SessionInfo, type Settings, type Snapshot, type Torrent } from './api'
+import { applyChanges } from './changes'
 import { COMPARE_RESULTS, parseRefine, refines, type SearchSortKey } from './search'
 import { isRunning } from './states'
 
@@ -200,6 +201,7 @@ class App {
   private retry: ReturnType<typeof setTimeout> | null = null
   private watchdog: ReturnType<typeof setInterval> | null = null
   private lastEvent = 0
+  private sleepTimer: ReturnType<typeof setTimeout> | null = null
   private anchor: Id | null = null
   private toastId = 0
 
@@ -207,7 +209,31 @@ class App {
     whenUnauthorized(() => this.signedOut())
     this.applyTheme()
     window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => this.applyTheme())
+    document.addEventListener('visibilitychange', () => this.visibilityChanged())
     await this.checkSession()
+  }
+
+  /** A page hidden for a while stops its stream, and picks it up again once it shows. */
+  private visibilityChanged(): void {
+    if (document.hidden) {
+      this.sleepSoon()
+      return
+    }
+    if (this.sleepTimer) clearTimeout(this.sleepTimer)
+    this.sleepTimer = null
+    if (this.phase !== 'login' && !this.source && !this.retry) void this.checkSession()
+  }
+
+  private sleepSoon(): void {
+    if (this.sleepTimer) clearTimeout(this.sleepTimer)
+    this.sleepTimer = setTimeout(() => {
+      this.sleepTimer = null
+      if (!document.hidden || !this.source) return
+      this.source.close()
+      this.source = null
+      if (this.watchdog) clearInterval(this.watchdog)
+      this.watchdog = null
+    }, 30_000)
   }
 
   private async checkSession(): Promise<void> {
@@ -231,6 +257,7 @@ class App {
     this.source?.close()
     this.source = null
     if (this.retry) clearTimeout(this.retry)
+    this.retry = null
     if (this.watchdog) clearInterval(this.watchdog)
     this.watchdog = null
     this.phase = 'login'
@@ -256,14 +283,15 @@ class App {
 
   private connect(): void {
     this.source?.close()
-    const source = new EventSource('/api/events')
+    const source = new EventSource('/api/events?changes=true')
     this.source = source
     this.lastEvent = Date.now()
     source.addEventListener('snapshot', (event) => {
-      this.lastEvent = Date.now()
-      this.snapshot = JSON.parse((event as MessageEvent<string>).data) as Snapshot
-      this.live = 'live'
-      if ((this.rss !== null || this.view === 'rss') && this.snapshot.rss_rev !== this.rssRev) void this.loadRss()
+      this.received(JSON.parse((event as MessageEvent<string>).data) as Snapshot)
+    })
+    source.addEventListener('changes', (event) => {
+      if (!this.snapshot) return
+      this.received(applyChanges(this.snapshot, JSON.parse((event as MessageEvent<string>).data) as Changes))
     })
     source.addEventListener('finished', (event) => {
       const done = JSON.parse((event as MessageEvent<string>).data) as Finished
@@ -275,6 +303,14 @@ class App {
     this.watchdog = setInterval(() => {
       if (this.source === source && Date.now() - this.lastEvent > 6000) this.lost(source)
     }, 2000)
+    if (document.hidden) this.sleepSoon()
+  }
+
+  private received(snapshot: Snapshot): void {
+    this.lastEvent = Date.now()
+    this.snapshot = snapshot
+    this.live = 'live'
+    if ((this.rss !== null || this.view === 'rss') && snapshot.rss_rev !== this.rssRev) void this.loadRss()
   }
 
   private lost(source: EventSource): void {
@@ -289,6 +325,8 @@ class App {
 
   private scheduleRetry(): void {
     if (this.retry) clearTimeout(this.retry)
+    this.retry = null
+    if (document.hidden) return
     this.retry = setTimeout(() => {
       this.retry = null
       void this.checkSession()
@@ -476,6 +514,21 @@ class App {
 
   async removeTracker(id: Id, url: string, trackers: string[]): Promise<boolean> {
     return this.act({ action: 'set_trackers', id, trackers: trackers.filter((t) => t !== url) })
+  }
+
+  /** Asks before taking every failing tracker off a torrent. */
+  askRemoveFailing(id: Id, failing: string[], trackers: string[], isPrivate: boolean, done: () => void): void {
+    if (!failing.length) return
+    const kept = trackers.filter((t) => !failing.includes(t))
+    const n = failing.length
+    const what = n === 1 ? '1 failing tracker' : `${n} failing trackers`
+    const after = isPrivate ? 'a private torrent finds peers only through its trackers, so it will find none.' : 'peers will come from DHT only.'
+    this.confirm = {
+      message: kept.length ? `take ${what} off this torrent? the other ${kept.length} stay.` : `every tracker is failing. take all ${n} off? ${after}`,
+      confirm: 'remove',
+      danger: true,
+      run: () => void this.act({ action: 'set_trackers', id, trackers: kept }).then((ok) => ok && done())
+    }
   }
 
   private async removeNow(ids: Id[], deleteFiles: boolean): Promise<void> {

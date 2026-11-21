@@ -29,6 +29,8 @@ pub struct PeerStats {
     pub state: &'static str,
     pub conn_kind: Option<ConnectionKind>,
     pub client_name: Option<String>,
+    /// Pieces of the torrent the peer says it has.
+    pub have_pieces: u32,
 }
 
 impl From<&super::atomic::PeerCountersAtomic> for PeerCounters {
@@ -54,10 +56,17 @@ impl From<&super::atomic::PeerCountersAtomic> for PeerCounters {
     }
 }
 
-impl From<&Peer> for PeerStats {
-    fn from(peer: &Peer) -> Self {
+impl PeerStats {
+    pub(crate) fn new(peer: &Peer, total_pieces: usize) -> Self {
         let state = peer.get_state();
         Self {
+            have_pieces: match state {
+                PeerState::Live(l) => l
+                    .bitfield
+                    .get(..total_pieces)
+                    .map_or(0, |bits| bits.count_ones() as u32),
+                _ => 0,
+            },
             counters: peer.stats.counters.as_ref().into(),
             state: state.name(),
             conn_kind: match state {

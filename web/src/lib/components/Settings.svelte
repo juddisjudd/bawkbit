@@ -442,9 +442,11 @@
           max="1000"
           placeholder="no limit"
           value={draft.max_active_downloads || ''}
+          aria-describedby="queue-hint"
           onchange={(e) => setNumber('max_active_downloads', e.currentTarget.value, 0, 1000, 'downloads at once')}
         />
       </label>
+      <span class="hint" id="queue-hint">the rest wait their turn. one stuck for a minute lets the next start.</span>
       <h3>stop seeding</h3>
       <label class="row">
         <span>at ratio</span>

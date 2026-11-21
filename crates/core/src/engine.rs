@@ -19,6 +19,7 @@ use librqbit::{
     TorrentStatsState,
 };
 use tokio::sync::{broadcast, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::api::*;
 use crate::geoip::Countries;
@@ -64,6 +65,9 @@ const DEAD_AFTER: Duration = Duration::from_secs(60 * 60);
 const DEAD_FAILURES: u32 = 3;
 /// Ticks between looks for dead trackers.
 const PRUNE_TICKS: u64 = 5 * 60;
+/// A download slower than this for `SLOW_AFTER` keeps going but gives its queue place to the next one.
+const SLOW_BPS: u64 = 2 * 1024;
+const SLOW_AFTER: Duration = Duration::from_secs(60);
 
 /// A torrent that just finished, with what the finish program is told about it.
 struct Done {
@@ -105,6 +109,8 @@ struct Live {
     last_uploaded: HashMap<Id, u64>,
     peer_bytes: HashMap<(Id, String), (u64, u64, Instant)>,
     history: VecDeque<[u64; 2]>,
+    /// When each running download last went below `SLOW_BPS`.
+    slow_since: HashMap<Id, Instant>,
     scheduled: Option<bool>,
     applied_limits: Option<(u64, u64)>,
     free_space: Option<u64>,
@@ -132,6 +138,7 @@ struct Inner {
     live: Mutex<Live>,
     snapshot: watch::Sender<Arc<Snapshot>>,
     rev: AtomicU64,
+    /// Held while the session restarts or torrents change in bulk; the tick skips a beat meanwhile.
     rebuilding: tokio::sync::Mutex<()>,
     http: reqwest::Client,
     /// For files from fixed addresses that may redirect, such as the country database.
@@ -141,6 +148,8 @@ struct Inner {
     countries: Countries,
     lists: trackers::Lists,
     pruning: AtomicBool,
+    /// Keeps saves of torrents.json in order, so an older copy never lands after a newer one.
+    saving: Mutex<()>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -192,6 +201,7 @@ impl Core {
                 countries,
                 lists,
                 pruning: AtomicBool::new(false),
+                saving: Mutex::new(()),
             }),
         };
         core.tick().await;
@@ -476,6 +486,7 @@ impl Core {
             .write()
             .unwrap_or_else(|p| p.into_inner()) = new.clone();
         if old.download_dir != new.download_dir {
+            std::fs::create_dir_all(&new.download_dir).ok();
             self.edit_store(|store| store.last_save_path = None);
         }
         let lists_wanted = new.trackers.add_from_lists
@@ -483,7 +494,7 @@ impl Core {
         if (new.peer_countries && !old.peer_countries) || lists_wanted {
             self.spawn_update_downloads();
         }
-        if old.needs_new_session(&new) || old.download_dir != new.download_dir {
+        if old.needs_new_session(&new) {
             self.rebuild_session().await?;
         }
         self.tick().await;
@@ -532,6 +543,7 @@ impl Core {
     }
 
     fn save_store(&self) {
+        let _saving = lock(&self.inner.saving);
         if self.inner.store_dirty.swap(false, Ordering::Relaxed) {
             let store = lock(&self.inner.store).clone();
             if let Err(err) = store.save(&self.inner.paths.store) {
@@ -551,15 +563,19 @@ impl Core {
     pub async fn execute(&self, action: Action) -> Result<Reply> {
         match action {
             Action::Pause { ids } => {
+                // The tick waits meanwhile, so it cannot restart a queued torrent halfway through.
+                let _busy = self.inner.rebuilding.lock().await;
+                self.edit_store(|store| {
+                    for id in &ids {
+                        let entry = store.entry(id);
+                        entry.queued = false;
+                        entry.forced = false;
+                    }
+                });
                 for id in ids {
                     if let Ok(handle) = self.handle(&id) {
                         self.session().pause(&handle).await.ok();
                     }
-                    self.edit_store(|store| {
-                        let entry = store.entry(&id);
-                        entry.queued = false;
-                        entry.forced = false;
-                    });
                 }
             }
             Action::Resume { ids } => self.resume(ids, false).await,
@@ -616,20 +632,31 @@ impl Core {
                 }
             }),
             Action::Remove { ids, delete_files } => {
+                let mut removed = Vec::new();
+                let mut failure = None;
                 for id in ids {
                     lock(&self.inner.pending).retain(|pending| pending.id != id);
                     if let Ok(hash) = id20(&id)
                         && self.session().get(TorrentIdOrHash::Hash(hash)).is_some()
-                    {
-                        self.session()
+                        && let Err(err) = self
+                            .session()
                             .delete(TorrentIdOrHash::Hash(hash), delete_files)
-                            .await?;
+                            .await
+                    {
+                        failure = Some(err);
+                        break;
                     }
-                    self.edit_store(|store| {
-                        store.torrents.remove(&id);
-                        store.waiting.remove(&id);
-                    });
                     lock(&self.inner.live).downloading.remove(&id);
+                    removed.push(id);
+                }
+                self.edit_store(|store| {
+                    for id in &removed {
+                        store.torrents.remove(id);
+                        store.waiting.remove(id);
+                    }
+                });
+                if let Some(err) = failure {
+                    return Err(err);
                 }
             }
             Action::SetFiles { id, files } => {
@@ -796,20 +823,27 @@ impl Core {
     }
 
     async fn resume(&self, ids: Vec<Id>, forced: bool) {
-        for id in ids {
-            let Ok(handle) = self.handle(&id) else {
-                continue;
-            };
-            let finished = handle.stats().finished;
-            self.edit_store(|store| {
-                let entry = store.entry(&id);
+        let _busy = self.inner.rebuilding.lock().await;
+        let handles: Vec<(Id, Handle, bool)> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let handle = self.handle(&id).ok()?;
+                let finished = handle.stats().finished;
+                Some((id, handle, finished))
+            })
+            .collect();
+        self.edit_store(|store| {
+            for (id, _, finished) in &handles {
+                let entry = store.entry(id);
                 entry.queued = false;
                 entry.forced = forced;
-                if entry.done || finished {
+                if entry.done || *finished {
                     entry.keep_seeding = entry.done || entry.keep_seeding;
                     entry.done = false;
                 }
-            });
+            }
+        });
+        for (_, handle, _) in handles {
             self.session().unpause(&handle).await.ok();
         }
     }
@@ -1232,26 +1266,47 @@ impl Core {
     }
 
     pub fn details(&self, id: &str) -> Result<Details> {
+        self.details_of(id, None)
+    }
+
+    /// Like `details`, but fills only the lists `part` shows; the others stay empty.
+    pub fn details_part(&self, id: &str, part: DetailsPart) -> Result<Details> {
+        self.details_of(id, Some(part))
+    }
+
+    /// A magnet link with every tracker the torrent has.
+    pub fn magnet(&self, id: &str) -> Result<String> {
+        let handle = self.handle(id)?;
+        let mut trackers = trackers_of(&handle);
+        trackers.sort();
+        let name = handle.name().unwrap_or_else(|| id.to_string());
+        Ok(magnet_link(id, &name, &trackers))
+    }
+
+    fn details_of(&self, id: &str, part: Option<DetailsPart>) -> Result<Details> {
+        let wants = |wanted: DetailsPart| part.is_none_or(|part| part == wanted);
         let handle = self.handle(id)?;
         let api = self.api();
         let key = TorrentIdOrHash::Hash(handle.info_hash());
-        let listed = api
-            .api_torrent_details(key)
-            .map_err(|err| anyhow!("{err}"))?;
         let stats = handle.stats();
-        let files = listed
-            .files
-            .unwrap_or_default()
-            .into_iter()
-            .enumerate()
-            .map(|(index, file)| File {
-                index,
-                path: file.components.join("/"),
-                size: file.length,
-                done: stats.file_progress.get(index).copied().unwrap_or_default(),
-                included: file.included,
-            })
-            .collect();
+        let files = if wants(DetailsPart::Files) {
+            api.api_torrent_details(key)
+                .map_err(|err| anyhow!("{err}"))?
+                .files
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(index, file)| File {
+                    index,
+                    path: file.components.join("/"),
+                    size: file.length,
+                    done: stats.file_progress.get(index).copied().unwrap_or_default(),
+                    included: file.included,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let (piece_size, pieces) = handle
             .metadata
             .load()
@@ -1261,22 +1316,34 @@ impl Core {
                 (lengths.default_piece_length(), lengths.total_pieces())
             })
             .unwrap_or_default();
-        let piece_map = match api.api_dump_haves(key) {
-            Ok((have, total)) => {
-                let bits: Vec<bool> = (0..total as usize)
-                    .map(|ix| have.get(ix).map(|bit| *bit).unwrap_or(false))
-                    .collect();
-                piece_map(&bits)
-            }
-            Err(_) => {
-                let fraction = stats.progress_bytes as f64 / stats.total_bytes.max(1) as f64;
-                vec![(fraction * 255.0) as u8; PIECE_MAP.min(pieces.max(1) as usize)]
+        let piece_map = if !wants(DetailsPart::Overview) {
+            Vec::new()
+        } else {
+            match api.api_dump_haves(key) {
+                Ok((have, total)) => {
+                    let bits: Vec<bool> = (0..total as usize)
+                        .map(|ix| have.get(ix).map(|bit| *bit).unwrap_or(false))
+                        .collect();
+                    piece_map(&bits)
+                }
+                Err(_) => {
+                    let fraction = stats.progress_bytes as f64 / stats.total_bytes.max(1) as f64;
+                    vec![(fraction * 255.0) as u8; PIECE_MAP.min(pieces.max(1) as usize)]
+                }
             }
         };
-        let peers = self.peers(id, &api, key);
+        let peers = if wants(DetailsPart::Peers) {
+            self.peers(id, &api, key, pieces)
+        } else {
+            Vec::new()
+        };
         let mut trackers = trackers_of(&handle);
         trackers.sort();
-        let tracker_reports = self.tracker_reports(&handle, &trackers);
+        let tracker_reports = if wants(DetailsPart::Trackers) {
+            self.tracker_reports(&handle, &trackers)
+        } else {
+            Vec::new()
+        };
         let name = handle.name().unwrap_or_else(|| id.to_string());
         Ok(Details {
             id: id.to_string(),
@@ -1367,7 +1434,7 @@ impl Core {
         self.inner.pruning.store(false, Ordering::Release);
     }
 
-    fn peers(&self, id: &str, api: &Api, key: TorrentIdOrHash) -> Vec<Peer> {
+    fn peers(&self, id: &str, api: &Api, key: TorrentIdOrHash, pieces: u32) -> Vec<Peer> {
         let Ok(snapshot) = api.api_peer_stats(key, Default::default()) else {
             return Vec::new();
         };
@@ -1396,6 +1463,7 @@ impl Core {
                 };
                 live.peer_bytes.insert(key, (fetched, uploaded, now));
                 Peer {
+                    progress: (stats.have_pieces as f32 / pieces.max(1) as f32).min(1.0),
                     country: countries.and_then(|countries| countries.of(&addr)),
                     addr,
                     client: stats.client_name,
@@ -1498,13 +1566,14 @@ impl Core {
         settings: &Settings,
     ) -> (Vec<Torrent>, Vec<Op>, Vec<Done>) {
         let now = crate::now();
+        let tick_at = Instant::now();
         let mut store = lock(&self.inner.store);
         let mut live = lock(&self.inner.live);
         let mut dirty = false;
         let mut rows = Vec::with_capacity(handles.len());
         let mut ops = Vec::new();
         let mut finished = Vec::new();
-        let mut queue: Vec<(i64, usize)> = Vec::new();
+        let mut queue: Vec<(i64, usize, bool)> = Vec::new();
 
         let limited = &store.category_limits;
         live.groups
@@ -1606,13 +1675,10 @@ impl Core {
                 dirty = true;
                 ops.push(Op::Pause(handle.clone()));
             }
-            if !entry.forced
-                && matches!(
-                    state,
-                    State::Downloading | State::Stalled | State::Queued | State::Checking
-                )
-            {
-                queue.push((entry.added, rows.len()));
+            let running = matches!(state, State::Downloading | State::Stalled);
+            let slow = slow_for_long(&mut live.slow_since, &id, running, down, tick_at);
+            if !entry.forced && (running || matches!(state, State::Queued | State::Checking)) {
+                queue.push((entry.added, rows.len(), slow));
             }
 
             rows.push(Torrent {
@@ -1648,9 +1714,9 @@ impl Core {
 
         queue.sort();
         let max = settings.max_active_downloads as usize;
-        for (position, (_, row)) in queue.iter().enumerate() {
+        let places = queue_places(queue.iter().map(|(_, _, slow)| *slow), max);
+        for ((_, row, _), should_run) in queue.iter().zip(places) {
             let torrent = &mut rows[*row];
-            let should_run = max == 0 || position < max;
             let handle = &handles[*row];
             match (torrent.state, should_run) {
                 (State::Queued, true) => {
@@ -1669,6 +1735,8 @@ impl Core {
         }
 
         live.last_uploaded
+            .retain(|id, _| rows.iter().any(|row| &row.id == id));
+        live.slow_since
             .retain(|id, _| rows.iter().any(|row| &row.id == id));
         if dirty {
             self.inner.store_dirty.store(true, Ordering::Relaxed);
@@ -1782,12 +1850,13 @@ impl Core {
 async fn build_session(paths: &Paths, settings: &Settings) -> Result<Arc<Session>> {
     let download_dir = PathBuf::from(&settings.download_dir);
     std::fs::create_dir_all(&download_dir).ok();
-    let options = |listen: bool| {
+    let options = |attempt: Attempt, token: CancellationToken| {
         let (down, up) = settings.effective_limits();
         SessionOptions {
+            cancellation_token: Some(token),
             dht: settings.dht.then(|| DhtSessionConfig {
                 bootstrap_addrs: None,
-                port: None,
+                port: attempt.dht_port,
                 persistence: Some(DhtPersistenceConfig {
                     dump_interval: None,
                     config_filename: Some(paths.dht.clone()),
@@ -1798,7 +1867,7 @@ async fn build_session(paths: &Paths, settings: &Settings) -> Result<Arc<Session
                 folder: Some(paths.session.clone()),
             }),
             peer_id: Some(peer_id()),
-            listen: listen.then(|| ListenerOptions {
+            listen: attempt.listen.then(|| ListenerOptions {
                 mode: if settings.utp {
                     ListenerMode::TcpAndUtp
                 } else {
@@ -1817,18 +1886,58 @@ async fn build_session(paths: &Paths, settings: &Settings) -> Result<Arc<Session
             ..Default::default()
         }
     };
-    match Session::new_with_opts(download_dir.clone(), options(true)).await {
-        Ok(session) => Ok(session),
-        Err(err) => {
-            tracing::warn!(
-                "cannot listen on port {}: {err:#}; starting without incoming connections",
-                settings.listen_port
-            );
-            Session::new_with_opts(download_dir, options(false))
-                .await
-                .context("cannot start the torrent engine")
+    let mut failure = None;
+    for attempt in Attempt::ALL {
+        let token = CancellationToken::new();
+        match Session::new_with_opts(download_dir.clone(), options(attempt, token.clone())).await {
+            Ok(session) => {
+                if !attempt.listen {
+                    tracing::warn!(
+                        "cannot listen on port {}; started without incoming connections",
+                        settings.listen_port
+                    );
+                }
+                return Ok(session);
+            }
+            Err(err) => {
+                // A failed start can leave sockets open that the next attempt needs.
+                token.cancel();
+                tracing::warn!("cannot start with {}: {err:#}", attempt.what);
+                failure = Some(err);
+            }
         }
     }
+    Err(failure.unwrap_or_else(|| anyhow!("no way to start")))
+        .context("cannot start the torrent engine")
+}
+
+/// One way to start the session, from the preferred one down.
+#[derive(Clone, Copy)]
+struct Attempt {
+    listen: bool,
+    /// `None` reuses the port saved in dht.json; `Some(0)` lets the system pick one.
+    dht_port: Option<u16>,
+    what: &'static str,
+}
+
+impl Attempt {
+    const ALL: [Attempt; 3] = [
+        Attempt {
+            listen: true,
+            dht_port: None,
+            what: "the saved DHT port",
+        },
+        Attempt {
+            listen: true,
+            dht_port: Some(0),
+            what: "a new DHT port",
+        },
+        Attempt {
+            listen: false,
+            dht_port: Some(0),
+            what: "no incoming connections",
+        },
+    ];
 }
 
 /// An Azureus-style peer id, so other clients show "bawkbit" for us.
@@ -1908,6 +2017,37 @@ fn bps(limit: u64) -> Option<NonZeroU32> {
 
 fn id20(id: &str) -> Result<Id20> {
     Id20::from_str(id.trim()).map_err(|_| anyhow!("{id} is not a torrent id"))
+}
+
+/// Notes how long a running download has been slow; true once that has lasted `SLOW_AFTER`.
+fn slow_for_long(
+    since: &mut HashMap<Id, Instant>,
+    id: &str,
+    running: bool,
+    down: u64,
+    now: Instant,
+) -> bool {
+    if !running || down >= SLOW_BPS {
+        since.remove(id);
+        return false;
+    }
+    let started = *since.entry(id.to_string()).or_insert(now);
+    now.duration_since(started) >= SLOW_AFTER
+}
+
+/// Whether each download in the queue, oldest first, may run: at most `max` (0 for no limit), and slow ones keep running without taking a place.
+fn queue_places(slow: impl IntoIterator<Item = bool>, max: usize) -> Vec<bool> {
+    let mut taken = 0;
+    slow.into_iter()
+        .map(|slow| {
+            if slow {
+                return true;
+            }
+            let runs = max == 0 || taken < max;
+            taken += usize::from(runs);
+            runs
+        })
+        .collect()
 }
 
 fn goal_reached(settings: &Settings, ratio: f32, completed: Option<i64>, now: i64) -> bool {
@@ -2480,6 +2620,54 @@ mod tests {
         Core::start(home.to_path_buf()).await.unwrap()
     }
 
+    #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows lets the DHT bind a UDP port another socket holds, so nothing fails there"
+    )]
+    async fn the_engine_starts_when_the_saved_dht_port_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let token = CancellationToken::new();
+        librqbit::dht::PersistentDht::create(
+            DhtPersistenceConfig {
+                dump_interval: Some(Duration::from_millis(50)),
+                config_filename: Some(scratch.join("dht.json")),
+            },
+            Some(0),
+            false,
+            Some(Vec::new()),
+            Some(token.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut saved: serde_json::Value = loop {
+            let read = std::fs::read(scratch.join("dht.json")).ok();
+            if let Some(value) = read.and_then(|bytes| serde_json::from_slice(&bytes).ok()) {
+                break value;
+            }
+            assert!(Instant::now() < deadline, "the DHT never saved itself");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        token.cancel();
+
+        let taken = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        saved["addr"] = format!("[::]:{port}").into();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("dht.json"), saved.to_string()).unwrap();
+
+        let core = start_core(&home, &dir.path().join("downloads"), |s| s.dht = true).await;
+        let session = core.session();
+        let dht = session.get_dht().expect("DHT is on");
+        assert_ne!(dht.listen_addr().port(), port);
+        core.shutdown().await;
+    }
+
     #[test]
     fn only_trackers_that_never_answered_for_an_hour_count_as_dead() {
         let now = std::time::SystemTime::now();
@@ -2637,6 +2825,28 @@ mod tests {
         assert_eq!(written.trim(), "data.bin 196608");
         leecher.shutdown().await;
         seeder.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_details_part_fills_only_its_own_lists() {
+        let root = tempfile::tempdir().unwrap();
+        let (folder, bytes) = shared_file(root.path(), "parts").await;
+        let core = start_core(&root.path().join("home"), root.path(), |_| {}).await;
+        let id = add_file(&core, bytes, &folder, true).await;
+        wait_until(&core, &id, "seeding", |t| t.state == State::Seeding).await;
+
+        let full = core.details(&id).unwrap();
+        assert_eq!(full.files.len(), 1);
+        assert!(!full.piece_map.is_empty());
+        let overview = core.details_part(&id, DetailsPart::Overview).unwrap();
+        assert_eq!(overview.piece_map, full.piece_map);
+        assert!(overview.files.is_empty());
+        let files = core.details_part(&id, DetailsPart::Files).unwrap();
+        assert_eq!(files.files, full.files);
+        assert!(files.piece_map.is_empty());
+        assert_eq!(files.pieces, full.pieces);
+        assert_eq!(core.magnet(&id).unwrap(), full.magnet);
+        core.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2838,6 +3048,53 @@ mod tests {
         assert_eq!(sanitize("a/b:c?"), "a_b_c_");
         assert_eq!(sanitize(" name. "), "name");
         assert_eq!(sanitize("..."), "torrent");
+    }
+
+    #[test]
+    fn a_download_counts_as_slow_only_after_a_minute_below_the_threshold() {
+        let mut since = HashMap::new();
+        let start = Instant::now();
+        assert!(!slow_for_long(&mut since, "a", true, 0, start));
+        assert!(!slow_for_long(
+            &mut since,
+            "a",
+            true,
+            100,
+            start + Duration::from_secs(59)
+        ));
+        assert!(slow_for_long(&mut since, "a", true, 0, start + SLOW_AFTER));
+        assert!(!slow_for_long(
+            &mut since,
+            "a",
+            true,
+            SLOW_BPS,
+            start + SLOW_AFTER * 2
+        ));
+        assert!(!slow_for_long(
+            &mut since,
+            "a",
+            true,
+            0,
+            start + SLOW_AFTER * 2
+        ));
+        assert!(!slow_for_long(
+            &mut since,
+            "a",
+            false,
+            0,
+            start + SLOW_AFTER * 4
+        ));
+        assert!(since.is_empty());
+    }
+
+    #[test]
+    fn slow_downloads_keep_running_without_taking_a_queue_place() {
+        assert_eq!(
+            queue_places([true, false, true, false, false], 2),
+            [true, true, true, true, false]
+        );
+        assert_eq!(queue_places([false, false, false], 0), [true, true, true]);
+        assert_eq!(queue_places([false, true, false], 1), [true, true, false]);
     }
 
     #[test]

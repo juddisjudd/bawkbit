@@ -9,7 +9,7 @@
   import Users from '@lucide/svelte/icons/users'
   import X from '@lucide/svelte/icons/x'
   import type { Component } from 'svelte'
-  import { api, type Details, type TrackerReport } from '$lib/api'
+  import { api, type Details, type TrackerReport, type TrackerStatus } from '$lib/api'
   import { bytes, count, date, eta, percent, ratio, speed, splitPath } from '$lib/format'
   import { app, type DetailsTab } from '$lib/state.svelte'
   import { isRunning, looks } from '$lib/states'
@@ -32,6 +32,44 @@
   let trackerText = $state('')
   let trackerBusy = $state(false)
 
+  type TrackerSort = 'address' | 'working' | 'failing'
+  const trackerSorts: { id: TrackerSort; label: string }[] = [
+    { id: 'address', label: 'a–z' },
+    { id: 'working', label: 'working first' },
+    { id: 'failing', label: 'failing first' }
+  ]
+  let trackerSort = $state<TrackerSort>(readTrackerSort())
+
+  function readTrackerSort(): TrackerSort {
+    try {
+      const saved = localStorage.getItem('bawkbit.tracker-sort')
+      return saved === 'working' || saved === 'failing' ? saved : 'address'
+    } catch {
+      return 'address'
+    }
+  }
+
+  function setTrackerSort(sort: TrackerSort): void {
+    trackerSort = sort
+    try {
+      localStorage.setItem('bawkbit.tracker-sort', sort)
+    } catch {
+      // the choice just lasts until the page reloads
+    }
+  }
+
+  const rank: Record<TrackerStatus, number> = { working: 0, waiting: 1, failing: 2 }
+
+  const trackerRows = $derived.by(() => {
+    if (!shown) return []
+    const rows = shown.trackers.map((url) => ({ url, report: shown.tracker_reports?.find((r) => r.url === url) }))
+    if (trackerSort === 'address') return rows
+    const sign = trackerSort === 'working' ? 1 : -1
+    return rows.sort((a, b) => sign * (rank[a.report?.status ?? 'waiting'] - rank[b.report?.status ?? 'waiting']))
+  })
+
+  const failingTrackers = $derived(trackerRows.filter((row) => row.report?.status === 'failing').map((row) => row.url))
+
   const torrent = $derived(app.current)
   const shown = $derived(details && details.id === app.focused ? details : null)
   const ownPending = $derived(pending && pending.id === app.focused ? pending.files : null)
@@ -42,6 +80,7 @@
     if (!id) return
     let alive = true
     const load = async () => {
+      if (document.hidden) return
       try {
         const next = await api.details(id)
         if (alive) {
@@ -123,6 +162,12 @@
     trackerBusy = true
     if (await app.removeTracker(id, url, shown.trackers)) await refresh(id)
     trackerBusy = false
+  }
+
+  function removeFailing(): void {
+    if (!shown || trackerBusy) return
+    const id = shown.id
+    app.askRemoveFailing(id, failingTrackers, shown.trackers, shown.private, () => void refresh(id))
   }
 
   async function addListTrackers(): Promise<void> {
@@ -316,6 +361,10 @@
                     {/if}{peer.addr}
                   </span>
                   <span class="truncate muted">{peer.client ?? ''}</span>
+                  <span class="pprog num" title="how much of the torrent this peer has">
+                    <span class="mini"><span class={[(peer.progress ?? 0) >= 1 && 'full']} style:width="{(peer.progress ?? 0) * 100}%"></span></span>
+                    <span class="muted">{percent(peer.progress ?? 0)}</span>
+                  </span>
                   <span class="r num d">{speed(peer.down)}</span>
                   <span class="r num u">{speed(peer.up)}</span>
                   <span class="r num muted" title="downloaded from this peer">{peer.downloaded ? bytes(peer.downloaded) : ''}</span>
@@ -329,9 +378,22 @@
         {#if shown.trackers.length === 0}
           <p class="muted pad">no trackers. peers come from DHT.</p>
         {:else}
+          {#if shown.trackers.length > 1 || failingTrackers.length}
+            <div class="tracker-bar">
+              {#if shown.trackers.length > 1}
+                <span class="seg" role="group" aria-label="sort trackers">
+                  {#each trackerSorts as sort (sort.id)}
+                    <button type="button" class={{ active: trackerSort === sort.id }} aria-pressed={trackerSort === sort.id} onclick={() => setTrackerSort(sort.id)}>{sort.label}</button>
+                  {/each}
+                </span>
+              {/if}
+              {#if failingTrackers.length}
+                <button type="button" class="btn small danger" disabled={trackerBusy} onclick={removeFailing}><Trash />remove failing ({failingTrackers.length})</button>
+              {/if}
+            </div>
+          {/if}
           <div class="table trackers">
-            {#each shown.trackers as url (url)}
-              {@const report = shown.tracker_reports?.find((r) => r.url === url)}
+            {#each trackerRows as { url, report } (url)}
               {@const said = trackerSaid(report)}
               <div class="tr">
                 <span class={['dot', report?.status ?? 'waiting']} title={said.label}></span>
@@ -522,13 +584,15 @@
     cursor: pointer;
     text-align: left;
   }
-  .fprog {
+  .fprog,
+  .pprog {
     display: flex;
     align-items: center;
     gap: 8px;
     justify-content: flex-end;
   }
-  .fprog .muted {
+  .fprog .muted,
+  .pprog .muted {
     min-width: 4.5ch;
     text-align: right;
   }
@@ -548,14 +612,51 @@
     text-align: right;
     white-space: nowrap;
   }
+  .mini span.full {
+    background: var(--success);
+  }
   .peers .tr {
-    grid-template-columns: minmax(150px, 1.1fr) minmax(0, 1.3fr) 84px 84px 76px 44px;
+    grid-template-columns: minmax(150px, 1.1fr) minmax(0, 1.3fr) 110px 84px 84px 76px 44px;
   }
   .flag {
     display: inline-block;
     margin-right: 8px;
     vertical-align: -1px;
     border-radius: 2px;
+  }
+  .tracker-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 16px 4px;
+  }
+  .seg {
+    display: flex;
+    border: 1px solid var(--border-weak);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .seg button {
+    height: 26px;
+    padding: 0 10px;
+    border: 0;
+    border-left: 1px solid var(--border-weak);
+    background: none;
+    color: var(--text-weak);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .seg button:first-child {
+    border-left: 0;
+  }
+  .seg button:hover {
+    color: var(--text-strong);
+  }
+  .seg button.active {
+    background: var(--bg-strong);
+    color: var(--text-inverted);
   }
   .trackers .tr {
     grid-template-columns: 8px minmax(0, 1fr) 24px 24px;
@@ -643,11 +744,12 @@
     display: none;
   }
   .sheet .peers .tr {
-    grid-template-columns: minmax(0, 1fr) 76px 76px;
+    grid-template-columns: minmax(0, 1fr) 44px 76px 76px;
   }
+  .sheet .pprog .mini,
   .sheet .peers .tr > :nth-child(2),
-  .sheet .peers .tr > :nth-child(5),
-  .sheet .peers .tr > :nth-child(6) {
+  .sheet .peers .tr > :nth-child(6),
+  .sheet .peers .tr > :nth-child(7) {
     display: none;
   }
 </style>

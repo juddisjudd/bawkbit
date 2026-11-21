@@ -231,8 +231,7 @@ fn new_id() -> String {
 
 impl Settings {
     pub fn load(path: &Path) -> Option<Self> {
-        let bytes = std::fs::read(path).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        crate::store::read_json(path)
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {

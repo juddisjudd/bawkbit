@@ -72,6 +72,21 @@ export interface Snapshot {
   rss_rev: number
 }
 
+/** What changed since the last event, sent as a `changes` event after the first `snapshot`. */
+export interface Changes {
+  rev: number
+  /** Rows that are new or changed. */
+  torrents: Torrent[]
+  /** Ids of rows that went away. */
+  removed: Id[]
+  totals: Totals
+  categories?: Category[]
+  tags?: string[]
+  /** Speed samples since the last event, oldest first. */
+  history: [number, number][]
+  rss_rev: number
+}
+
 /** A torrent that finished downloading, sent as a `finished` event. */
 export interface Finished {
   id: Id
@@ -96,6 +111,8 @@ export interface Peer {
   uploaded: number
   /** Two capital letters, such as DE, while peer countries are on and known. */
   country?: string | null
+  /** How much of the torrent the peer has, 0 to 1. */
+  progress?: number
 }
 
 export type TrackerStatus = 'waiting' | 'working' | 'failing'
